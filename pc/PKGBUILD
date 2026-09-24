@@ -1,0 +1,22 @@
+# Builds the computer side from this checkout:  cd pc && makepkg -si
+pkgname=passkey
+pkgver=1.4
+pkgrel=1
+pkgdesc="Android device fingerprint as a FIDO2 security key: login, sudo, polkit, browsers"
+arch=(x86_64 aarch64)
+url="https://github.com/mahirsn/passkey"
+license=(GPL-3.0-or-later)
+depends=(pam pam-u2f libfido2 python systemd)
+optdepends=('android-tools: connect over USB'
+            'python-dbus: connect over Bluetooth'
+            'python-gobject: connect over Bluetooth'
+            'bluez: connect over Bluetooth')
+install=passkey.install
+
+build() {
+    make -C "$startdir" PREFIX=/usr BUILDDIR="$srcdir/build"
+}
+
+package() {
+    make -C "$startdir" PREFIX=/usr BUILDDIR="$srcdir/build" DESTDIR="$pkgdir" install
+}

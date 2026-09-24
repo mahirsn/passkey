@@ -1,0 +1,14 @@
+[Unit]
+Description=passkey: Android device fingerprint as a FIDO2 key (USB and Bluetooth)
+After=bluetooth.service
+Wants=bluetooth.service
+Before=display-manager.service
+
+[Service]
+ExecStartPre=-/sbin/modprobe uhid
+ExecStart=@LIBDIR@/passkeyd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

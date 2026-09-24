@@ -1,0 +1,278 @@
+#!/bin/bash
+# passkey: use the fingerprint on your Android device for login, the lock
+# screen, sudo and system (polkit) prompts on this Linux computer.
+#   passkey setup            check this system, start the service, add it to
+#                           PAM, register your device (safe to run again)
+#   passkey add [name]       register another Android device
+#   passkey list             registered devices
+#   passkey remove <n|name>  unregister one device
+#   passkey uninstall        undo setup, registered devices included
+#   passkey status           what is connected and registered
+# Your password always keeps working: with no device nearby, a rejected
+# prompt or no answer within 30 s, PAM moves on to the password.
+# The files come from `make install` or a package; this only configures.
+set -euo pipefail
+
+LIB="@LIBDIR@"                       # filled in by the Makefile
+PAM_MODULE="@PAMDIR@/pam_passkey.so"
+DROPIN=/etc/systemd/system/passkeyd.service.d
+KEYS=/etc/passkey/u2f_keys
+NAMES=/etc/passkey/names     # <user> TAB <key handle> TAB <name>
+HOST="$(hostnamectl hostname 2>/dev/null || hostname)"
+ORIGIN="pam://$HOST"
+MARK="# passkey: fingerprint from your Android device (undo with: passkey uninstall)"
+U2F_ARGS="authfile=$KEYS origin=$ORIGIN appid=$ORIGIN userverification=1 nouserok"
+# Any of our lines, old or new.
+OURS="pam_(u2f|passkey)[.]so .*authfile=$KEYS "
+# Terminal and polkit prompts: password and fingerprint at the same time.
+PARALLEL=(sudo sudo-i su login polkit-1)
+# Lock and login screens: Enter on an empty field asks the device.
+ON_EMPTY=(kde plasmalogin sddm gdm-password lightdm)
+SERVICES=("${PARALLEL[@]}" "${ON_EMPTY[@]}")
+USER_NAME="${SUDO_USER:-$USER}"
+
+as_root() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+# The PAM line for a service. pam_passkey hands a typed password to pam_unix
+# through try_first_pass; stacks whose pam_unix lacks it (Debian's
+# common-auth) get plain pam_u2f, which asks the device first.
+line_for() {
+    local mode=parallel s
+    for s in "${ON_EMPTY[@]}"; do [[ $1 == "$s" ]] && mode=on-empty; done
+    if [[ -f $PAM_MODULE && -x $LIB/passkey-u2f ]] && grep -qsE 'pam_unix[.]so.*(try|use)_first_pass' \
+            /etc/pam.d/system-auth /etc/pam.d/common-auth /etc/pam.d/password-auth; then
+        echo "-auth      sufficient   pam_passkey.so mode=$mode $U2F_ARGS"
+    else
+        echo "-auth      sufficient   pam_u2f.so $U2F_ARGS cue [cue_prompt=Confirm with your fingerprint on your device, or reject there to type your password]"
+    fi
+}
+
+# The user's registered key handles, oldest first.
+handles() { sed -n "s|^$USER_NAME:||p" "$KEYS" 2>/dev/null | tr ':' '\n' | cut -d, -f1 | grep . || true; }
+name_of() { awk -F'\t' -v u="$USER_NAME" -v h="$1" '$1 == u && $2 == h {print $3; exit}' "$NAMES" 2>/dev/null || true; }
+names() { local h n i=0; while read -r h; do i=$((i + 1)); n="$(name_of "$h")"; echo "${n:-Android device $i}"; done < <(handles); }
+
+list() {
+    local n i=0
+    while read -r n; do i=$((i + 1)); printf '  %d  %s\n' "$i" "$n"; done < <(names)
+    [[ $i -gt 0 ]] || echo "  No devices registered."
+}
+
+# Writes stdin over a file under /etc/passkey.
+put() { local tmp; tmp="$(mktemp)"; cat > "$tmp"; as_root install -Dm644 "$tmp" "$1"; rm -f "$tmp"; }
+
+device() { fido2-token -L 2>/dev/null | grep -m1 'vendor=0x1209, product=0x7ab1' | cut -d: -f1 || true; }
+
+has_systemd() { [[ -d /run/systemd/system ]]; }   # what sd_booted(3) checks
+
+# Distribution family, for package names in hints.
+family() {
+    local id=" $(. /etc/os-release 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}") "
+    case "$id" in
+    *" arch "*) echo arch ;; *" debian "*|*" ubuntu "*) echo debian ;;
+    *" fedora "*|*" rhel "*) echo fedora ;; *) echo other ;;
+    esac
+}
+# pkg <arch> <debian> <fedora>: the package name here.
+pkg() {
+    case "$(family)" in arch) echo "$1" ;; debian) echo "$2" ;; fedora) echo "$3" ;;
+    *) echo "$1 (Arch) / $2 (Debian) / $3 (Fedora)" ;; esac
+}
+
+# Checks what setup needs. Nothing is installed: missing packages are named.
+check_env() {
+    local missing=() warn=()
+    [[ -x $LIB/passkeyd ]] || { echo "passkey is not installed: run  make install  in pc/ (or install the package) first." >&2; exit 1; }
+    [[ -d /etc/pam.d ]] || { echo "No /etc/pam.d: this system does not use Linux-PAM." >&2; exit 1; }
+    [[ $EUID -eq 0 ]] || command -v sudo >/dev/null || { echo "Run as root: sudo is not installed." >&2; exit 1; }
+    compgen -G "/usr/lib*/security/pam_u2f.so" >/dev/null || compgen -G "/lib*/security/pam_u2f.so" >/dev/null ||
+        compgen -G "/usr/lib/*-linux-gnu/security/pam_u2f.so" >/dev/null || compgen -G "/lib/*-linux-gnu/security/pam_u2f.so" >/dev/null ||
+        missing+=("pam_u2f.so: $(pkg pam-u2f libpam-u2f pam-u2f)")
+    command -v pamu2fcfg >/dev/null || missing+=("pamu2fcfg: $(pkg pam-u2f pamu2fcfg pamu2fcfg)")
+    command -v fido2-token >/dev/null || missing+=("fido2-token: $(pkg libfido2 fido2-tools fido2-tools)")
+    command -v python3 >/dev/null || missing+=("python3: $(pkg python python3 python3)")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Missing, please install these packages and run  passkey setup  again:" >&2
+        printf '  %s\n' "${missing[@]}" >&2
+        exit 1
+    fi
+    [[ -e /dev/uhid ]] || as_root modprobe uhid 2>/dev/null || true
+    [[ -e /dev/uhid ]] || { echo "No /dev/uhid: this kernel lacks the uhid module (CONFIG_UHID), which the virtual key needs." >&2; exit 1; }
+
+    local usb=1 bt=1
+    command -v adb >/dev/null || { usb=0; warn+=("USB off: adb is missing ($(pkg android-tools adb android-tools)).") ; }
+    if ! python3 -c 'import dbus, gi' 2>/dev/null; then
+        bt=0; warn+=("Bluetooth off: Python D-Bus/GObject missing ($(pkg "python-dbus python-gobject" "python3-dbus python3-gi" "python3-dbus python3-gobject")).")
+    elif has_systemd && ! systemctl is-active -q bluetooth.service; then
+        warn+=("Bluetooth: bluetooth.service is not running; start it to connect over Bluetooth.")
+    fi
+    has_systemd || warn+=("systemd is not running: the service is not set up. Start it as root at boot with your init system:"
+        "    PASSKEY_ADB_USER=$USER_NAME $LIB/passkeyd")
+    [[ ${#warn[@]} -eq 0 ]] || printf 'Warning: %s\n' "${warn[@]}" >&2
+    if [[ $usb -eq 0 && $bt -eq 0 ]]; then
+        echo "Neither USB (adb) nor Bluetooth (Python D-Bus) is available: no way to reach the device." >&2
+        exit 1
+    fi
+}
+
+# The earlier script installer copied files to /usr/local/lib/passkey and
+# wrote its own unit, which would override the installed one.
+legacy_cleanup() {
+    local old=/usr/local/lib/passkey
+    [[ -f $old/source ]] || return 0
+    if grep -qs "^ExecStart=$old/passkeyd$" /etc/systemd/system/passkeyd.service; then
+        has_systemd && as_root systemctl disable passkeyd.service 2>/dev/null || true
+        as_root rm -f /etc/systemd/system/passkeyd.service
+    fi
+    [[ "$(readlink /usr/local/bin/passkey || true)" == "$old/passkey" ]] && as_root rm -f /usr/local/bin/passkey
+    as_root rm -f "$old/passkey" "$old/passkeyd.service" "$old/source"
+    [[ $LIB == "$old" ]] || as_root rm -rf "$old"
+    echo "  Removed the files of the earlier script installer."
+}
+
+# Writes "$2" (a file) over the PAM file for service "$1", keeping symlinks.
+pam_write() {
+    local target
+    target="$(readlink -f "/etc/pam.d/$1")"
+    as_root install -m644 "$2" "$target.passkey-new"
+    as_root mv "$target.passkey-new" "$target"
+}
+
+pam_add() {
+    local s=$1 src tmp LINE
+    LINE="$(line_for "$s")"
+    if [[ -e /etc/pam.d/$s ]]; then src=/etc/pam.d/$s
+    elif [[ -f /usr/lib/pam.d/$s ]]; then src=/usr/lib/pam.d/$s
+    else return 0; fi
+    grep -qxF -- "$LINE" "$src" && return 0
+    grep -qE '^-?auth[[:space:]]' "$src" || return 0
+    tmp="$(mktemp)"
+    if grep -qE "$OURS" "$src"; then
+        # An older line of ours (say, from before a hostname change): replace it.
+        awk -v ours="$OURS" -v line="$LINE" '$0 ~ ours {print line; next} {print}' "$src" > "$tmp"
+    else
+        # Above the first auth line, but after guards written directly in the
+        # file (nologin, securetty, faillock preauth). Guards inside included
+        # stacks are skipped when the key answers, like for any sufficient module.
+        awk -v mark="$MARK" -v line="$LINE" '
+            !done && /^-?auth[ \t]/ && !/pam_(nologin|securetty|shells|rootok)\.so|pam_faillock\.so.*preauth/ {
+                print mark; print line; done=1 }
+            {print}' "$src" > "$tmp"
+    fi
+    if [[ $src == /usr/lib/* ]]; then
+        # A vendor file: our copy in /etc overrides it. Remembered, so removal
+        # can delete the copy and let vendor updates through again.
+        as_root install -m644 "$tmp" "/etc/pam.d/$s"
+        as_root install -Dm644 /dev/null "/etc/passkey/copied/$s"
+    else
+        pam_write "$s" "$tmp"
+    fi
+    rm -f "$tmp"
+    echo "  PAM: $s"
+}
+
+pam_remove() {
+    local s=$1 tmp
+    [[ -e /etc/pam.d/$s ]] || return 0
+    grep -qE "$OURS|^# passkey: " "/etc/pam.d/$s" || return 0
+    tmp="$(mktemp)"
+    # Only our lines, matched by content, never by position.
+    grep -v "^# passkey: " "/etc/pam.d/$s" | grep -vE "$OURS" > "$tmp" || true
+    if [[ -f /etc/passkey/copied/$s && -f /usr/lib/pam.d/$s ]] && cmp -s "$tmp" "/usr/lib/pam.d/$s"; then
+        as_root rm -f "/etc/pam.d/$s" "/etc/passkey/copied/$s"
+    else
+        pam_write "$s" "$tmp"
+        as_root rm -f "/etc/passkey/copied/$s"
+    fi
+    rm -f "$tmp"
+    echo "  PAM: $s restored"
+}
+
+case "${1:-status}" in
+setup)
+    check_env
+    legacy_cleanup
+    if has_systemd; then
+        # Who runs adb: the daemon uses that user's adb server and key.
+        printf '[Service]\nEnvironment=PASSKEY_ADB_USER=%s\n' "$USER_NAME" | put "$DROPIN/user.conf"
+        as_root systemctl daemon-reload
+        as_root systemctl enable passkeyd.service
+        as_root systemctl restart passkeyd.service
+    fi
+    for s in "${SERVICES[@]}"; do pam_add "$s"; done
+    if as_root grep -qs "^$USER_NAME:." "$KEYS"; then
+        echo "Done. Registered devices (add another with: passkey add):"; list
+        exit 0
+    fi
+    ;&
+add)
+    echo "Open the Passkey app on your Android device (USB cable or Bluetooth)..."
+    for _ in $(seq 45); do [[ -n "$(device)" ]] && break; sleep 2; done
+    if [[ -z "$(device)" ]]; then
+        echo "No device showed up. Everything else is installed; run  passkey setup  again once it is connected." >&2
+        exit 1
+    fi
+    # Default name: the device's own name when adb sees exactly one, made unique.
+    def="$(timeout 5 adb shell settings get global device_name 2>/dev/null | tr -d '\r' || true)"
+    [[ -n $def && $def != null ]] || def="Android device"
+    base="$def"; i=1
+    while names | grep -xF -- "$def" >/dev/null; do i=$((i + 1)); def="$base $i"; done
+    name="${2:-}"
+    [[ -z $name && -t 0 ]] && read -rp "Name for this device [$def]: " name
+    name="${name:-$def}"; name="${name//$'\t'/ }"
+    if names | grep -xF -- "$name" >/dev/null; then
+        echo "\"$name\" is already used. Pick another: passkey add <name>" >&2; exit 1
+    fi
+    echo "Confirm with your fingerprint on the device..."
+    cred="$(pamu2fcfg -u "$USER_NAME" -o "$ORIGIN" -i "$ORIGIN" -V -n)"   # ":<credential>"
+    as_root install -d -m755 /etc/passkey
+    as_root touch "$KEYS"
+    if as_root grep -q "^$USER_NAME:" "$KEYS"; then
+        # Another device for the same user: append to that user's line.
+        as_root sed -i "s|^$USER_NAME:.*|&$cred|" "$KEYS"
+    else
+        echo "$USER_NAME$cred" | as_root tee -a "$KEYS" >/dev/null
+    fi
+    as_root chmod 644 "$KEYS"
+    { cat "$NAMES" 2>/dev/null || true; printf '%s\t%s\t%s\n' "$USER_NAME" "$(cut -d, -f1 <<< "${cred#:}")" "$name"; } | put "$NAMES"
+    echo "Done: \"$name\" is registered. Login, the lock screen, sudo and system prompts now accept your fingerprint."
+    ;;
+list)
+    list
+    ;;
+remove)
+    [[ -n ${2:-} ]] || { echo "usage: passkey remove <number or name>" >&2; list >&2; exit 2; }
+    mapfile -t hs < <(handles)
+    mapfile -t ns < <(names)
+    pick=-1
+    for i in "${!hs[@]}"; do [[ $2 == "$((i + 1))" || $2 == "${ns[i]}" ]] && { pick=$i; break; }; done
+    [[ $pick -ge 0 ]] || { echo "No registered device \"$2\". Registered:" >&2; list >&2; exit 1; }
+    h="${hs[pick]}"
+    # Drop that credential from the user's line; the line goes when it is the last.
+    awk -F: -v OFS=: -v u="$USER_NAME" -v h="$h" '
+        $1 != u {print; next}
+        {out = u; for (i = 2; i <= NF; i++) { split($i, f, ","); if (f[1] != h) out = out ":" $i }
+         if (out != u) print out}' "$KEYS" | put "$KEYS"
+    awk -F'\t' -v u="$USER_NAME" -v h="$h" '!($1 == u && $2 == h)' "$NAMES" 2>/dev/null | put "$NAMES"
+    echo "Removed \"${ns[pick]}\"."
+    [[ -n "$(handles)" ]] || echo "No devices left: sign-in asks only for the password now."
+    ;;
+uninstall)
+    for s in "${SERVICES[@]}"; do pam_remove "$s"; done
+    has_systemd && { as_root systemctl disable --now passkeyd.service 2>/dev/null || true; }
+    as_root rm -rf "$DROPIN" /etc/passkey
+    has_systemd && as_root systemctl daemon-reload
+    echo "Setup undone. Set up again with: passkey setup"
+    ;;
+status)
+    if has_systemd; then
+        systemctl is-active passkeyd.service >/dev/null && echo "service: running" || echo "service: not running"
+    else
+        pgrep -f "$LIB/passkeyd" >/dev/null && echo "service: running" || echo "service: not running (no systemd)"
+    fi
+    d="$(device)"; echo "device: ${d:-not connected}"
+    for s in "${SERVICES[@]}"; do grep -qsE "$OURS" "/etc/pam.d/$s" && echo "PAM: $s" || true; done
+    echo "registered:"; list
+    ;;
+*) echo "usage: passkey setup | add [name] | list | remove <n|name> | uninstall | status" >&2; exit 2 ;;
+esac

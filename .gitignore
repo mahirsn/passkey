@@ -1,0 +1,8 @@
+android/out/
+__pycache__/
+store/
+tests/
+pc/build/
+pc/src/
+pc/pkg/
+pc/*.pkg.tar*
