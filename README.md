@@ -9,13 +9,15 @@ over USB or Bluetooth.
 1. Install the Passkey app on your Android device and open it once.
    - For Bluetooth: pair the device with the computer.
    - For USB: turn on USB debugging and install `adb` on the computer.
-2. On the computer, install the files, then configure as your user:
+2. On the computer, install the files, then configure as your user.
+   On Arch:
    ```
    git clone https://github.com/mahirsn/passkey
    cd passkey/pc
-   makepkg -si                   # Arch; elsewhere: make && sudo make install
+   makepkg -si
    passkey setup
    ```
+   Elsewhere, replace `makepkg -si` with `make && sudo make install`.
    `passkey setup` checks the system first and names any missing package;
    it installs none itself. Confirm with your fingerprint when asked.
 
