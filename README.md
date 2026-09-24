@@ -41,7 +41,7 @@ Makefile   make (pc), make android, make install
 
 ```
 passkey status             # what is connected and registered
-passkey add [name]         # register another device
+passkey add [name]         # register another device (asks which, if several are connected)
 passkey list               # registered devices
 passkey remove <n|name>    # unregister a device
 passkey uninstall          # undo setup, registrations included

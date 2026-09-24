@@ -16,6 +16,7 @@ set -euo pipefail
 LIB="@LIBDIR@"                       # filled in by the Makefile
 PAM_MODULE="@PAMDIR@/pam_passkey.so"
 DROPIN=/etc/systemd/system/passkeyd.service.d
+STATE=/run/passkey           # from passkeyd: devices (name TAB label), use
 KEYS=/etc/passkey/u2f_keys
 NAMES=/etc/passkey/names     # <user> TAB <key handle> TAB <name>
 HOST="$(hostnamectl hostname 2>/dev/null || hostname)"
@@ -58,8 +59,15 @@ list() {
     [[ $i -gt 0 ]] || echo "  No devices registered."
 }
 
-# Writes stdin over a file under /etc/passkey.
+# Writes stdin over a root-owned file.
 put() { local tmp; tmp="$(mktemp)"; cat > "$tmp"; as_root install -Dm644 "$tmp" "$1"; rm -f "$tmp"; }
+
+# "Pixel 8 (USB)" for a "usb:<serial> TAB Pixel 8" line of $STATE/devices.
+conn_label() {
+    local n=${1%%$'\t'*} l=${1#*$'\t'} t=Bluetooth
+    [[ $n == usb:* ]] && t=USB
+    echo "${l:-${n#*:}} ($t)"
+}
 
 device() { fido2-token -L 2>/dev/null | grep -m1 'vendor=0x1209, product=0x7ab1' | cut -d: -f1 || true; }
 
@@ -212,8 +220,26 @@ add)
         echo "No device showed up. Everything else is installed; run  passkey setup  again once it is connected." >&2
         exit 1
     fi
-    # Default name: the device's own name when adb sees exactly one, made unique.
-    def="$(timeout 5 adb shell settings get global device_name 2>/dev/null | tr -d '\r' || true)"
+    # With several connected (a phone and a tablet, say), ask which one; the
+    # daemon then sends requests only to it until this command ends.
+    mapfile -t conns < <(cat "$STATE/devices" 2>/dev/null || true)
+    pick="${conns[0]:-}"
+    if [[ ${#conns[@]} -gt 1 ]]; then
+        [[ -t 0 ]] || { echo "Several devices are connected: run  passkey add  in a terminal to pick one." >&2; exit 1; }
+        labels=(); for c in "${conns[@]}"; do labels+=("$(conn_label "$c")"); done
+        echo "Several devices are connected. Which one should be registered?"
+        pick=""
+        PS3="Device number: "
+        select l in "${labels[@]}"; do [[ -n $l ]] && { pick="${conns[REPLY - 1]}"; break; }; done
+        [[ -n $pick ]] || exit 1
+    fi
+    if [[ -n $pick ]]; then
+        trap 'as_root rm -f "$STATE/use"' EXIT
+        printf '%s %s\n' "${pick%%$'\t'*}" "$$" | put "$STATE/use"
+    fi
+    # Default name: the device's own name, made unique.
+    def="${pick#*$'\t'}"; [[ $pick == *$'\t'* ]] || def=""
+    [[ -n $def ]] || def="$(timeout 5 adb shell settings get global device_name 2>/dev/null | tr -d '\r' || true)"
     [[ -n $def && $def != null ]] || def="Android device"
     base="$def"; i=1
     while names | grep -xF -- "$def" >/dev/null; do i=$((i + 1)); def="$base $i"; done

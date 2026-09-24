@@ -26,6 +26,10 @@ SDP_RECORD = f"""<?xml version="1.0" encoding="UTF-8" ?>
 ADB_USER = os.environ.get("PASSKEY_ADB_USER", "")
 SOCKET = os.environ.get("PASSKEY_SOCKET", "passkey")   # "passkey.test" reaches test builds
 VERBOSE = os.environ.get("PASSKEY_DEBUG", "1") == "1"   # one short line per request
+# Shared with `passkey add`: "devices" lists the connections (name TAB label),
+# "use" (name SPACE pid) sends every request to one of them while that
+# process lives.
+STATE = os.environ.get("PASSKEY_STATE", "/run/passkey")
 
 
 def log(*a):
@@ -37,8 +41,9 @@ class Link:
     """One device connection. Frame: 4-byte length + body; REQ/RESP/CANCEL
     carry a 4-byte request number after the type byte."""
 
-    def __init__(self, name, sock, prio):
+    def __init__(self, name, sock, prio, label=""):
         self.name, self.sock, self.prio = name, sock, prio
+        self.label = " ".join(label.split())   # no tabs or newlines in the list
         self.responses = queue.Queue()          # (request number, payload) or None
         self.alive = True
         self.pong = threading.Event()
@@ -93,6 +98,18 @@ class Link:
         self.sock.close()
 
 
+def chosen_name():
+    # ponytail: a pid reused after `passkey add` was SIGKILLed keeps the choice
+    # alive; compare /proc/<pid>/stat start times if that ever matters.
+    try:
+        with open(STATE + "/use") as f:
+            name, pid = f.read().split()
+        pid = int(pid)
+    except (OSError, ValueError):
+        return None
+    return name if os.path.exists(f"/proc/{pid}") else None
+
+
 class Links:
     def __init__(self, on_change):
         self.lock = threading.Lock()
@@ -102,7 +119,8 @@ class Links:
     def add(self, link):
         with self.lock:
             self.items.append(link)
-        log("connected:", link.name)
+            self._publish()
+        log("connected:", link.name, link.label)
         threading.Thread(target=link.run, args=(self.remove,), daemon=True).start()
         self.on_change()
 
@@ -111,13 +129,33 @@ class Links:
             if link not in self.items:
                 return
             self.items.remove(link)
+            self._publish()
         log("disconnected:", link.name)
         self.on_change()
 
+    def _publish(self):
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            with open(STATE + "/devices.new", "w") as f:
+                f.writelines(f"{l.name}\t{l.label}\n" for l in self.items)
+            os.replace(STATE + "/devices.new", STATE + "/devices")
+        except OSError as e:
+            log("state:", e)
+
     def best(self):
+        """The chosen connection while `passkey add` runs (none if it went
+        away: a request must not reach another device), else USB before
+        Bluetooth, then the oldest."""
         with self.lock:
             live = [l for l in self.items if l.alive]
-            return min(live, key=lambda l: l.prio) if live else None
+        chosen = chosen_name()
+        if chosen is not None:
+            return next((l for l in live if l.name == chosen), None)
+        return min(live, key=lambda l: l.prio) if live else None
+
+    def any(self):
+        with self.lock:
+            return any(l.alive for l in self.items)
 
     def names(self):
         with self.lock:
@@ -406,6 +444,20 @@ def adb_devices():
     return [l.split("\t")[0] for l in text.splitlines() if l.endswith("\tdevice")]
 
 
+def adb_device_name(serial):
+    """The name set on the device (Settings > About), as a label."""
+    out = b""
+    try:
+        with adb_request("host:transport:" + serial) as s:
+            adb_request("shell:settings get global device_name", s)
+            while chunk := s.recv(256):
+                out += chunk
+    except (OSError, AdbError):
+        pass
+    name = out.decode(errors="replace").strip()
+    return "" if name == "null" else name
+
+
 def adb_start_server():
     # Only when none is running, and with the user's own adb key, so the
     # device does not ask "Allow USB debugging?" a second time.
@@ -448,7 +500,7 @@ def adb_loop(links):
                     got += chunk
                 if got == struct.pack(">IB", 1, PONG):
                     sock.settimeout(None)
-                    links.add(Link(name, sock, prio=0))
+                    links.add(Link(name, sock, prio=0, label=adb_device_name(serial)))
                     retry.pop(serial, None)
                     continue
                 sock.close()
@@ -484,6 +536,14 @@ def bluetooth(links):
     def addr(device):
         return "bt:" + str(device).rsplit("dev_", 1)[-1].replace("_", ":")
 
+    def alias(device):
+        # BlueZ answers NewConnection asynchronously, so it can answer this.
+        try:
+            return str(bus.get_object("org.bluez", device).Get(
+                "org.bluez.Device1", "Alias", dbus_interface=dbus.PROPERTIES_IFACE, timeout=2))
+        except dbus.DBusException:
+            return ""
+
     class Profile(dbus.service.Object):
         @dbus.service.method("org.bluez.Profile1", in_signature="", out_signature="")
         def Release(self):
@@ -493,7 +553,7 @@ def bluetooth(links):
         def NewConnection(self, device, fd, props):
             sock = socket.socket(fileno=fd.take())
             sock.setblocking(True)
-            links.add(Link(addr(device), sock, prio=1))
+            links.add(Link(addr(device), sock, prio=1, label=alias(device)))
 
         @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
         def RequestDisconnection(self, device):
@@ -532,7 +592,7 @@ def main():
 
     def changed():
         with lock:                     # decide and act as one step
-            if links.best():
+            if links.any():
                 uhid.create()
             else:
                 hid.cancel()
