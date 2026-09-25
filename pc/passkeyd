@@ -433,7 +433,7 @@ class Ctaphid:
                 rounds = [first, [l for l in devs.values() if l not in first]]
             else:
                 rounds = [list(devs.values())]
-            deadline = time.monotonic() + 45
+            deadline = time.monotonic() + 600   # the computer cancels sooner
             errors = []
             for targets in rounds:
                 if not targets:

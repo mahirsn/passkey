@@ -43,7 +43,11 @@
 
 #define HID_ID "HID_ID=0003:00001209:00007AB1"
 #define MAX_ARGS 32
-#define ASK_SECONDS 45          /* the device gives up after 30 s */
+/* How long the device is asked. Next to a password prompt it keeps asking
+ * while that prompt is open; the prompt's own timeout (sudo: 5 min) ends it.
+ * After Enter on an empty field nothing else is on screen, so not for long. */
+#define ASK_SECONDS_PARALLEL 600
+#define ASK_SECONDS_ON_EMPTY 45
 #ifndef HELPER
 #define HELPER "/usr/local/lib/passkey/passkey-u2f"
 #endif
@@ -110,7 +114,7 @@ struct ask {
  * child runs nothing but async-signal-safe calls before exec. The helper
  * writes "y" to fd 3; exit statuses are not used because the host may reap
  * its children itself. */
-static int ask_start(struct ask *a, const char *helper, const char *user, int argc, const char **argv) {
+static int ask_start(struct ask *a, int seconds, const char *helper, const char *user, int argc, const char **argv) {
     const char *args[MAX_ARGS + 3];
     int p[2], n = 0;
     args[n++] = helper;
@@ -128,7 +132,7 @@ static int ask_start(struct ask *a, const char *helper, const char *user, int ar
     if (a->pid < 0) { close(p[0]); return -1; }
     a->result = p[0];
     a->pidfd = (int) syscall(SYS_pidfd_open, a->pid, 0);
-    a->deadline = time(NULL) + ASK_SECONDS;
+    a->deadline = time(NULL) + seconds;
     return 0;
 }
 
@@ -181,7 +185,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
 
     struct ask a = { -1, -1, -1, 0 };
     int tries = 0;
-    if (!on_empty && !ask_start(&a, helper, user, u2f_argc, u2f_argv)) tries++;
+    int ask_seconds = on_empty ? ASK_SECONDS_ON_EMPTY : ASK_SECONDS_PARALLEL;
+    if (!on_empty && !ask_start(&a, ask_seconds, helper, user, u2f_argc, u2f_argv)) tries++;
 
     /* On the heap: if a GUI prompt is still open when the key wins, its thread
      * outlives this call (the process ends right after), so it is leaked. */
@@ -231,7 +236,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
             /* Empty: the user wants the fingerprint. Ask the device (again). */
             if (a.result < 0 && tries < 3) {
                 pam_info(pamh, "Confirm with your fingerprint on your device.");
-                if (!ask_start(&a, helper, user, u2f_argc, u2f_argv)) tries++;
+                if (!ask_start(&a, ask_seconds, helper, user, u2f_argc, u2f_argv)) tries++;
             }
             if (a.result < 0) break;
             continue;                              /* the helper may have answered too */

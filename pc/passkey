@@ -8,8 +8,10 @@
 #   passkey remove <n|name>  unregister one device
 #   passkey uninstall        undo setup, registered devices included
 #   passkey status           what is connected and registered
-# Your password always keeps working: with no device nearby, a rejected
-# prompt or no answer within 30 s, PAM moves on to the password.
+# Your password always keeps working: with no device nearby or a rejected
+# prompt, PAM moves on to the password. Next to a password prompt (sudo,
+# polkit) the device asks as long as that prompt is open; after Enter on an
+# empty lock screen field, for 45 s.
 # The files come from `make install` or a package; this only configures.
 set -euo pipefail
 
