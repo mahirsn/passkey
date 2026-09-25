@@ -115,6 +115,7 @@ class Links:
         self.lock = threading.Lock()
         self.items = []
         self.on_change = on_change
+        self.holder = None           # name of the last one that signed in
 
     def add(self, link):
         with self.lock:
@@ -142,16 +143,16 @@ class Links:
         except OSError as e:
             log("state:", e)
 
-    def best(self):
+    def best(self, skip=()):
         """The chosen connection while `passkey add` runs (none if it went
-        away: a request must not reach another device), else USB before
-        Bluetooth, then the oldest."""
+        away: a request must not reach another device), else the one that
+        last signed in, else USB before Bluetooth, then the oldest."""
         with self.lock:
-            live = [l for l in self.items if l.alive]
+            live = [l for l in self.items if l.alive and l not in skip]
         chosen = chosen_name()
         if chosen is not None:
-            return next((l for l in live if l.name == chosen), None)
-        return min(live, key=lambda l: l.prio) if live else None
+            return next((l for l in live if l.name == chosen and not skip), None)
+        return min(live, key=lambda l: (l.name != self.holder, l.prio)) if live else None
 
     def any(self):
         with self.lock:
@@ -251,6 +252,7 @@ class Uhid:
 PING_CMD, MSG, INIT, WINK, CBOR, CANCEL_CMD, KEEPALIVE, ERROR = 0x81, 0x83, 0x86, 0x88, 0x90, 0x91, 0xBB, 0xBF
 ERR_INVALID_CMD, ERR_INVALID_LEN, ERR_INVALID_SEQ, ERR_CHANNEL_BUSY, ERR_INVALID_CHANNEL = 0x01, 0x03, 0x04, 0x06, 0x0B
 CTAP2_ERR_OTHER = 0x7F
+GET_ASSERTION, NO_CREDENTIALS = 0x02, 0x2E
 BROADCAST = 0xFFFFFFFF
 
 
@@ -341,40 +343,63 @@ class Ctaphid:
         with self.lock:
             if self.busy is not None:
                 return self.error(cid, ERR_CHANNEL_BUSY)
-            me = self.busy = (cid, next(self.numbers), link)
+            me = self.busy = [cid, next(self.numbers), link]   # link changes on retry
         threading.Thread(target=self._cbor, args=(me, data), daemon=True).start()
 
     def _cbor(self, me, data):
-        cid, number, link = me
+        cid, number = me[0], me[1]
 
         def answer(cmd, payload):          # silent once the channel was reset
             if self.busy is me:
                 self.reply(cid, cmd, payload)
 
         try:
-            try:
-                link.send(struct.pack(">BI", REQ, number) + data)
-            except OSError:
-                return answer(CBOR, bytes([CTAP2_ERR_OTHER]))
             deadline = time.monotonic() + 45
-            while time.monotonic() < deadline and self.busy is me:
-                try:
-                    r = link.responses.get(timeout=0.1)
-                except queue.Empty:
-                    answer(KEEPALIVE, bytes([2]))    # waiting for the user
-                    continue
-                if r is None:                   # connection lost
-                    break
-                if r[0] != number:              # late answer to an abandoned request
-                    continue
+            tried = []
+            while True:
+                link = me[2]
+                tried.append(link)
+                r = self._ask(me, link, data, deadline)
+                if not r:                          # gone, timed out or empty
+                    return answer(CBOR, bytes([CTAP2_ERR_OTHER]))
                 if VERBOSE:
-                    log(f"ctap {data[0]:#04x} -> {r[1][0]:#04x}")
-                return answer(CBOR, r[1])
-            answer(CBOR, bytes([CTAP2_ERR_OTHER]))
+                    log(f"ctap {data[0]:#04x} -> {r[0]:#04x} ({link.name})")
+                # A key lives on the device that made it. pam_u2f and browsers
+                # first ask without a prompt which device holds it; the others
+                # say NO_CREDENTIALS, so the next device is asked.
+                if data[0] == GET_ASSERTION and r[0] == NO_CREDENTIALS:
+                    nxt = self.links.best(skip=tried)
+                    with self.lock:
+                        if nxt and self.busy is me:
+                            me[2] = nxt            # a cancel now goes there
+                            continue
+                elif data[0] == GET_ASSERTION and r[0] == 0:
+                    self.links.holder = link.name  # ask it first next time
+                return answer(CBOR, r)
         finally:
             with self.lock:
                 if self.busy is me:
                     self.busy = None
+
+    def _ask(self, me, link, data, deadline):
+        """The device's answer to one request, or None."""
+        try:
+            link.send(struct.pack(">BI", REQ, me[1]) + data)
+        except OSError:
+            return None
+        while time.monotonic() < deadline and self.busy is me:
+            try:
+                r = link.responses.get(timeout=0.1)
+            except queue.Empty:
+                if self.busy is me:
+                    self.reply(me[0], KEEPALIVE, bytes([2]))    # waiting for the user
+                continue
+            if r is None:                   # connection lost
+                return None
+            if r[0] != me[1]:               # late answer to an abandoned request
+                continue
+            return r[1]
+        return None
 
 
 # --- transports ---------------------------------------------------------------
