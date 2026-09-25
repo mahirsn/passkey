@@ -8,7 +8,7 @@ like a plugged-in key. CTAPHID packets are assembled here; only CTAP2
 requests go to the device, where the fingerprint is asked. When the device is
 away there is no key at all, so PAM moves on to the password immediately.
 """
-import itertools, os, pwd, queue, random, select, shutil, socket, struct, subprocess, threading, time
+import itertools, os, pwd, queue, random, re, select, shutil, socket, struct, subprocess, threading, time
 
 REQ, CANCEL, PING, RESP, PONG = 0x10, 0x11, 0x12, 0x20, 0x22
 BT_UUID = "7a1b6b65-7900-4e6f-9d2a-6d6168697273"
@@ -26,9 +26,10 @@ SDP_RECORD = f"""<?xml version="1.0" encoding="UTF-8" ?>
 ADB_USER = os.environ.get("PASSKEY_ADB_USER", "")
 SOCKET = os.environ.get("PASSKEY_SOCKET", "passkey")   # "passkey.test" reaches test builds
 VERBOSE = os.environ.get("PASSKEY_DEBUG", "1") == "1"   # one short line per request
-# Shared with `passkey add`: "devices" lists the connections (name TAB label),
-# "use" (name SPACE pid) sends every request to one of them while that
-# process lives.
+# Shared with `passkey add`: "devices" lists the connected devices (id TAB
+# label), "use" (id SPACE pid) sends every request to one of them while that
+# process lives. A device's id is its Bluetooth address, so its USB and
+# Bluetooth connections count as one device.
 STATE = os.environ.get("PASSKEY_STATE", "/run/passkey")
 
 
@@ -41,8 +42,9 @@ class Link:
     """One device connection. Frame: 4-byte length + body; REQ/RESP/CANCEL
     carry a 4-byte request number after the type byte."""
 
-    def __init__(self, name, sock, prio, label=""):
+    def __init__(self, name, sock, prio, label="", device=None):
         self.name, self.sock, self.prio = name, sock, prio
+        self.device = device or name
         self.label = " ".join(label.split())   # no tabs or newlines in the list
         self.responses = queue.Queue()          # (request number, payload) or None
         self.alive = True
@@ -98,7 +100,7 @@ class Link:
         self.sock.close()
 
 
-def chosen_name():
+def chosen_device():
     # ponytail: a pid reused after `passkey add` was SIGKILLed keeps the choice
     # alive; compare /proc/<pid>/stat start times if that ever matters.
     try:
@@ -115,13 +117,12 @@ class Links:
         self.lock = threading.Lock()
         self.items = []
         self.on_change = on_change
-        self.holder = None           # name of the last one that signed in
 
     def add(self, link):
         with self.lock:
             self.items.append(link)
             self._publish()
-        log("connected:", link.name, link.label)
+        log("connected:", link.name, link.label, "device " + link.device)
         threading.Thread(target=link.run, args=(self.remove,), daemon=True).start()
         self.on_change()
 
@@ -137,22 +138,25 @@ class Links:
     def _publish(self):
         try:
             os.makedirs(STATE, exist_ok=True)
+            labels = {}
+            for l in sorted(self.items, key=lambda l: l.prio):
+                if not labels.get(l.device):
+                    labels[l.device] = l.label
             with open(STATE + "/devices.new", "w") as f:
-                f.writelines(f"{l.name}\t{l.label}\n" for l in self.items)
+                f.writelines(f"{d}\t{label}\n" for d, label in labels.items())
             os.replace(STATE + "/devices.new", STATE + "/devices")
         except OSError as e:
             log("state:", e)
 
-    def best(self, skip=()):
-        """The chosen connection while `passkey add` runs (none if it went
-        away: a request must not reach another device), else the one that
-        last signed in, else USB before Bluetooth, then the oldest."""
+    def by_device(self):
+        """One connection per device, USB before Bluetooth (less delay), then
+        the oldest; devices in that same order."""
         with self.lock:
-            live = [l for l in self.items if l.alive and l not in skip]
-        chosen = chosen_name()
-        if chosen is not None:
-            return next((l for l in live if l.name == chosen and not skip), None)
-        return min(live, key=lambda l: (l.name != self.holder, l.prio)) if live else None
+            live = [l for l in self.items if l.alive]
+        out = {}
+        for l in sorted(live, key=lambda l: l.prio):
+            out.setdefault(l.device, l)
+        return out
 
     def any(self):
         with self.lock:
@@ -252,7 +256,61 @@ class Uhid:
 PING_CMD, MSG, INIT, WINK, CBOR, CANCEL_CMD, KEEPALIVE, ERROR = 0x81, 0x83, 0x86, 0x88, 0x90, 0x91, 0xBB, 0xBF
 ERR_INVALID_CMD, ERR_INVALID_LEN, ERR_INVALID_SEQ, ERR_CHANNEL_BUSY, ERR_INVALID_CHANNEL = 0x01, 0x03, 0x04, 0x06, 0x0B
 CTAP2_ERR_OTHER = 0x7F
-GET_ASSERTION, NO_CREDENTIALS = 0x02, 0x2E
+MAKE_CREDENTIAL, GET_ASSERTION, GET_INFO, GET_NEXT_ASSERTION = 0x01, 0x02, 0x04, 0x08
+OPERATION_DENIED, NO_CREDENTIALS = 0x27, 0x2E
+
+
+def cbor(b, i=0):
+    """One CBOR item at b[i]: (value, index after it)."""
+    major, info = b[i] >> 5, b[i] & 31
+    i += 1
+    if info < 24:
+        n = info
+    elif info < 28:
+        k = 1 << (info - 24)
+        n, i = int.from_bytes(b[i:i + k], "big"), i + k
+    else:
+        raise ValueError("indefinite length")
+    if major == 0:
+        return n, i
+    if major == 1:
+        return -1 - n, i
+    if major in (2, 3):
+        if len(b) < i + n:
+            raise ValueError("short")
+        return (b[i:i + n] if major == 2 else b[i:i + n].decode()), i + n
+    if major == 4:
+        out = []
+        for _ in range(n):
+            v, i = cbor(b, i)
+            out.append(v)
+        return out, i
+    if major == 5:
+        out = {}
+        for _ in range(n):
+            k, i = cbor(b, i)
+            out[k], i = cbor(b, i)
+        return out, i
+    if major == 6:                   # a tag: the item it wraps
+        return cbor(b, i)
+    return {20: False, 21: True}.get(info), i
+
+
+def silent(data):
+    """A getAssertion that only asks which device holds the key (up=false):
+    pam_u2f sends one before the real request. The app answers it without
+    asking the user."""
+    try:
+        m = cbor(data, 1)[0]
+        return data[0] == GET_ASSERTION and m.get(5, {}).get("up") is False
+    except Exception:
+        return False
+
+
+class Request:
+    def __init__(self, cid, number):
+        self.cid, self.number = cid, number
+        self.pending = []            # connections still asked
 BROADCAST = 0xFFFFFFFF
 
 
@@ -261,8 +319,10 @@ class Ctaphid:
         self.uhid, self.links = None, links
         self.partial = {}            # cid -> [cmd, total, data, next seq]
         self.lock = threading.Lock()
-        self.busy = None             # (cid, request number, link) of the request in flight
+        self.busy = None             # the Request in flight
         self.numbers = itertools.count(1)
+        self.holders = set()         # devices that said they hold the key
+        self.last = None             # device of the last approval (getNextAssertion)
 
     def reply(self, cid, cmd, data):
         head = struct.pack(">IBH", cid, cmd, len(data))
@@ -280,11 +340,17 @@ class Ctaphid:
         abandon: the channel was reset; nothing more is sent on it for this request."""
         with self.lock:
             busy = self.busy
-            if busy and abandon and busy[0] == cid:
+            if busy and abandon and busy.cid == cid:
                 self.busy = None
-        if busy and (cid is None or busy[0] == cid):
+            pending = list(busy.pending) if busy else []
+        if busy and (cid is None or busy.cid == cid):
+            self._withdraw(busy, pending)
+
+    @staticmethod
+    def _withdraw(req, links):
+        for l in links:
             try:
-                busy[2].send(struct.pack(">BI", CANCEL, busy[1]))
+                l.send(struct.pack(">BI", CANCEL, req.number))
             except OSError:
                 pass
 
@@ -304,7 +370,7 @@ class Ctaphid:
             if b == INIT:
                 self.partial.pop(cid, None)
                 self.cancel(cid, abandon=True)   # INIT on a busy channel aborts it
-            elif busy is not None and busy[0] != cid:
+            elif busy is not None and busy.cid != cid:
                 return self.error(cid, ERR_CHANNEL_BUSY)
             self.partial[cid] = [b, n, bytearray(pkt[7:7 + n]), 0]
         else:                              # continuation packet
@@ -337,69 +403,106 @@ class Ctaphid:
             return self.reply(cid, WINK, b"")
         if cmd != CBOR:
             return self.error(cid, ERR_INVALID_CMD)
-        link = self.links.best()
-        if not link:
+        if not data or not self.links.any():
             return self.reply(cid, CBOR, bytes([CTAP2_ERR_OTHER]))
         with self.lock:
             if self.busy is not None:
                 return self.error(cid, ERR_CHANNEL_BUSY)
-            me = self.busy = [cid, next(self.numbers), link]   # link changes on retry
+            me = self.busy = Request(cid, next(self.numbers))
         threading.Thread(target=self._cbor, args=(me, data), daemon=True).start()
 
     def _cbor(self, me, data):
-        cid, number = me[0], me[1]
-
         def answer(cmd, payload):          # silent once the channel was reset
             if self.busy is me:
-                self.reply(cid, cmd, payload)
+                self.reply(me.cid, cmd, payload)
 
         try:
+            devs = self.links.by_device()
+            chosen = chosen_device()
+            probe = silent(data)
+            if chosen is not None:          # `passkey add`: that device only
+                rounds = [[devs[chosen]] if chosen in devs else []]
+            elif data[0] == GET_INFO:       # the same app everywhere
+                rounds = [list(devs.values())[:1]]
+            elif data[0] == GET_NEXT_ASSERTION:
+                rounds = [[devs[self.last]] if self.last in devs else []]
+            elif data[0] == GET_ASSERTION and not probe and self.holders & devs.keys():
+                # Where the key is, so the others show no "No key" prompt;
+                # the rest only if none of those has it after all.
+                first = [l for d, l in devs.items() if d in self.holders]
+                rounds = [first, [l for l in devs.values() if l not in first]]
+            else:
+                rounds = [list(devs.values())]
             deadline = time.monotonic() + 45
-            tried = []
-            while True:
-                link = me[2]
-                tried.append(link)
-                r = self._ask(me, link, data, deadline)
-                if not r:                          # gone, timed out or empty
-                    return answer(CBOR, bytes([CTAP2_ERR_OTHER]))
-                if VERBOSE:
-                    log(f"ctap {data[0]:#04x} -> {r[0]:#04x} ({link.name})")
-                # A key lives on the device that made it. pam_u2f and browsers
-                # first ask without a prompt which device holds it; the others
-                # say NO_CREDENTIALS, so the next device is asked.
-                if data[0] == GET_ASSERTION and r[0] == NO_CREDENTIALS:
-                    nxt = self.links.best(skip=tried)
-                    with self.lock:
-                        if nxt and self.busy is me:
-                            me[2] = nxt            # a cancel now goes there
-                            continue
-                elif data[0] == GET_ASSERTION and r[0] == 0:
-                    self.links.holder = link.name  # ask it first next time
-                return answer(CBOR, r)
+            errors = []
+            for targets in rounds:
+                if not targets:
+                    continue
+                win, errs = self._fan_out(me, targets, data, deadline, probe)
+                if win:
+                    link, payload = win[0]
+                    if data[0] == GET_ASSERTION:
+                        self.last = link.device
+                        if probe:
+                            self.holders = {l.device for l, _ in win}
+                    return answer(CBOR, payload)
+                errors += errs
+                if not errs or any(e[0] != NO_CREDENTIALS for e in errs):
+                    break                   # refused, cancelled or gone: no next round
+            final = next((e for e in errors if e[0] != NO_CREDENTIALS), errors[0] if errors else None)
+            answer(CBOR, final or bytes([CTAP2_ERR_OTHER]))
         finally:
             with self.lock:
                 if self.busy is me:
                     self.busy = None
 
-    def _ask(self, me, link, data, deadline):
-        """The device's answer to one request, or None."""
-        try:
-            link.send(struct.pack(">BI", REQ, me[1]) + data)
-        except OSError:
-            return None
-        while time.monotonic() < deadline and self.busy is me:
+    def _fan_out(self, me, targets, data, deadline, wait_all):
+        """Asks every target at once. The first approval, or a refusal, ends
+        the request and the others are withdrawn; wait_all (a silent probe)
+        collects every answer. Returns ([(link, payload)] approvals, [errors])."""
+        pending = []
+        for l in targets:
             try:
-                r = link.responses.get(timeout=0.1)
-            except queue.Empty:
-                if self.busy is me:
-                    self.reply(me[0], KEEPALIVE, bytes([2]))    # waiting for the user
-                continue
-            if r is None:                   # connection lost
-                return None
-            if r[0] != me[1]:               # late answer to an abandoned request
-                continue
-            return r[1]
-        return None
+                l.send(struct.pack(">BI", REQ, me.number) + data)
+                pending.append(l)
+            except OSError:
+                pass
+        with self.lock:
+            me.pending = list(pending)
+        wins, errors, done, beat = [], [], False, 0.0
+        while pending and not done and time.monotonic() < deadline and self.busy is me:
+            heard = False
+            for l in list(pending):
+                try:
+                    r = l.responses.get_nowait()
+                except queue.Empty:
+                    continue
+                heard = True
+                if r is not None and r[0] != me.number:   # late answer to an abandoned request
+                    continue
+                pending.remove(l)
+                if not r or not r[1]:       # connection lost, or an empty answer
+                    errors.append(bytes([CTAP2_ERR_OTHER]))
+                    continue
+                if VERBOSE:
+                    log(f"ctap {data[0]:#04x}{' probe' if wait_all else ''} -> {r[1][0]:#04x} ({l.name})")
+                if r[1][0] == 0:
+                    wins.append((l, r[1]))
+                    done = not wait_all
+                else:
+                    errors.append(r[1])
+                    done = r[1][0] == OPERATION_DENIED and not wait_all   # the user said no
+                if done:
+                    break
+            if not heard:
+                if time.monotonic() - beat >= 0.1 and self.busy is me:
+                    self.reply(me.cid, KEEPALIVE, bytes([2]))    # waiting for the user
+                    beat = time.monotonic()
+                time.sleep(0.02)
+        with self.lock:
+            me.pending = []
+        self._withdraw(me, pending)
+        return wins, errors
 
 
 # --- transports ---------------------------------------------------------------
@@ -469,18 +572,25 @@ def adb_devices():
     return [l.split("\t")[0] for l in text.splitlines() if l.endswith("\tdevice")]
 
 
-def adb_device_name(serial):
-    """The name set on the device (Settings > About), as a label."""
+def adb_setting(serial, setting):
+    """A device setting, such as "global device_name" (the name in Settings >
+    About), or "" when it cannot be read."""
     out = b""
     try:
         with adb_request("host:transport:" + serial) as s:
-            adb_request("shell:settings get global device_name", s)
+            adb_request("shell:settings get " + setting, s)
             while chunk := s.recv(256):
                 out += chunk
     except (OSError, AdbError):
         pass
-    name = out.decode(errors="replace").strip()
-    return "" if name == "null" else name
+    v = out.decode(errors="replace").strip()
+    return "" if v == "null" else v
+
+
+def adb_device_id(serial):
+    """The device's Bluetooth address, the id its Bluetooth connection has too."""
+    a = adb_setting(serial, "secure bluetooth_address").upper()
+    return a if re.fullmatch(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", a) else "usb:" + serial
 
 
 def adb_start_server():
@@ -525,7 +635,8 @@ def adb_loop(links):
                     got += chunk
                 if got == struct.pack(">IB", 1, PONG):
                     sock.settimeout(None)
-                    links.add(Link(name, sock, prio=0, label=adb_device_name(serial)))
+                    links.add(Link(name, sock, prio=0, label=adb_setting(serial, "global device_name"),
+                                   device=adb_device_id(serial)))
                     retry.pop(serial, None)
                     continue
                 sock.close()
@@ -578,7 +689,7 @@ def bluetooth(links):
         def NewConnection(self, device, fd, props):
             sock = socket.socket(fileno=fd.take())
             sock.setblocking(True)
-            links.add(Link(addr(device), sock, prio=1, label=alias(device)))
+            links.add(Link(addr(device), sock, prio=1, label=alias(device), device=addr(device)[3:]))
 
         @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
         def RequestDisconnection(self, device):

@@ -62,12 +62,8 @@ list() {
 # Writes stdin over a root-owned file.
 put() { local tmp; tmp="$(mktemp)"; cat > "$tmp"; as_root install -Dm644 "$tmp" "$1"; rm -f "$tmp"; }
 
-# "Pixel 8 (USB)" for a "usb:<serial> TAB Pixel 8" line of $STATE/devices.
-conn_label() {
-    local n=${1%%$'\t'*} l=${1#*$'\t'} t=Bluetooth
-    [[ $n == usb:* ]] && t=USB
-    echo "${l:-${n#*:}} ($t)"
-}
+# "Pixel 8" for an "<id> TAB Pixel 8" line of $STATE/devices; the id if unnamed.
+conn_label() { local l=${1#*$'\t'}; echo "${l:-${1%%$'\t'*}}"; }
 
 device() { fido2-token -L 2>/dev/null | grep -m1 'vendor=0x1209, product=0x7ab1' | cut -d: -f1 || true; }
 
@@ -220,8 +216,9 @@ add)
         echo "No device showed up. Everything else is installed; run  passkey setup  again once it is connected." >&2
         exit 1
     fi
-    # With several connected (a phone and a tablet, say), ask which one; the
-    # daemon then sends requests only to it until this command ends.
+    # With several devices connected (a phone and a tablet, say), ask which
+    # one; the daemon then sends requests only to it until this command ends.
+    # A device on both USB and Bluetooth is listed once.
     mapfile -t conns < <(cat "$STATE/devices" 2>/dev/null || true)
     pick="${conns[0]:-}"
     if [[ ${#conns[@]} -gt 1 ]]; then

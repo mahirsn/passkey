@@ -49,5 +49,9 @@ passkey remove <n|name>    # unregister a device
 passkey uninstall          # undo setup, registrations included
 ```
 
+With several devices connected, a sign-in asks all of them at once and the
+first to answer wins. A device connected over both USB and Bluetooth is
+asked once, over USB.
+
 Removing: `sudo make uninstall` (or `pacman -R passkey`) runs
 `passkey uninstall` first, then removes the files.
