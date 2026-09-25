@@ -6,12 +6,14 @@ import android.hardware.biometrics.BiometricManager;
 import android.hardware.biometrics.BiometricPrompt;
 import android.os.Bundle;
 import android.os.CancellationSignal;
+import android.os.SystemClock;
 
 /** One confirmation: fingerprint (or the device PIN). Reports to KeyService and closes. */
 public class PromptActivity extends Activity {
     private CancellationSignal cancel = new CancellationSignal();
     private boolean started, reported, unlocking;
-    private long id;
+    private long id, startedAt;
+    private int quickCancels;       // in a row, over the lock screen
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -29,13 +31,21 @@ public class PromptActivity extends Activity {
         if (focus && !started && !reported) authenticate();
     }
 
+    // Some devices (a Galaxy Tab) let the prompt use the sensor over the lock
+    // screen, so one touch approves while the device stays locked. On others
+    // (a Mi 9T) the lock screen keeps the sensor and cancels the prompt at
+    // once, every time; those unlock first, and the device remembers it.
+    private boolean unlockFirst() {
+        return getSharedPreferences("prompt", MODE_PRIVATE).getBoolean("unlock_first", false);
+    }
+
     private void authenticate() {
         started = true;
         KeyguardManager km = getSystemService(KeyguardManager.class);
-        if (km.isKeyguardLocked()) {
-            // The lock screen owns the fingerprint sensor, so unlock first. The
-            // unlock alone never counts as approval: it does not say what is being
-            // approved, and face unlock or Smart Lock may not be strong.
+        if (km.isKeyguardLocked() && (unlockFirst() || quickCancels >= 2)) {
+            // Unlock, then the prompt. The unlock alone never counts as approval:
+            // it does not say what is being approved, and face unlock or Smart
+            // Lock may not be strong.
             if (unlocking) return;
             unlocking = true;
             km.requestDismissKeyguard(this, new KeyguardManager.KeyguardDismissCallback() {
@@ -50,6 +60,7 @@ public class PromptActivity extends Activity {
             return;
         }
         cancel = new CancellationSignal();
+        startedAt = SystemClock.elapsedRealtime();
         new BiometricPrompt.Builder(this)
                 .setTitle(getIntent().getStringExtra("title"))
                 .setSubtitle(getIntent().getStringExtra("detail"))
@@ -63,6 +74,13 @@ public class PromptActivity extends Activity {
                     @Override public void onAuthenticationError(int code, CharSequence msg) {
                         if (code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED && !reported) {
                             started = false;          // the system cut it short, not the user
+                            boolean quick = SystemClock.elapsedRealtime() - startedAt < 500;
+                            quickCancels = quick && km.isKeyguardLocked() ? quickCancels + 1 : 0;
+                            if (quickCancels == 2) {  // the lock screen has the sensor
+                                getSharedPreferences("prompt", MODE_PRIVATE).edit()
+                                        .putBoolean("unlock_first", true).apply();
+                                if (hasWindowFocus()) authenticate();
+                            }
                             return;
                         }
                         report(Authenticator.ERR_OPERATION_DENIED);
