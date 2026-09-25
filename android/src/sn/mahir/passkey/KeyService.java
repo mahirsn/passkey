@@ -39,8 +39,11 @@ import java.util.concurrent.Executors;
 public class KeyService extends Service {
     static final UUID BT_UUID = UUID.fromString("7a1b6b65-7900-4e6f-9d2a-6d6168697273");
     static final int REQ = 0x10, CANCEL = 0x11, PING = 0x12, RESP = 0x20, PONG = 0x22;
-    static final int PROMPT_TIMEOUT_MS = 30_000;
+    // The computer ends a request when its own prompt closes; this only covers
+    // a computer that went quiet without saying so.
+    static final int PROMPT_TIMEOUT_MS = 10 * 60_000;
     static final String TAG = "passkey";
+    static final String ACTION_REJECT = "sn.mahir.passkey.REJECT";
 
     /** Shown in the app; null when no computer is connected. */
     static volatile String link;
@@ -74,6 +77,14 @@ public class KeyService extends Service {
             if (id != current) return false;
             shown = a;
             return true;
+        }
+    }
+
+    /** The prompt closed without an answer (back button): the request stays
+     *  open and its notification brings the prompt back. */
+    static void detach(long id, PromptActivity a) {
+        synchronized (lock) {
+            if (id == current && shown == a) shown = null;
         }
     }
 
@@ -129,7 +140,13 @@ public class KeyService extends Service {
                 .setSmallIcon(R.drawable.ic_notify)
                 .setContentTitle(title).setContentText(detail)
                 .setContentIntent(pi)
-                .setAutoCancel(true).setTimeoutAfter(PROMPT_TIMEOUT_MS).build());
+                // Stays until the request ends, so a prompt closed by mistake
+                // can be opened again; "Reject" refuses it from here.
+                .setOngoing(true)
+                .addAction(new Notification.Action.Builder(null, "Reject", PendingIntent.getService(this, (int) id,
+                        new Intent(this, KeyService.class).setAction(ACTION_REJECT).putExtra("id", id),
+                        PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT)).build())
+                .build());
         try { startActivity(i); } catch (Exception e) { Log.w(TAG, "prompt not started", e); }
 
         int r;
@@ -171,7 +188,11 @@ public class KeyService extends Service {
         if (!Flags.AUTO_APPROVE) new Thread(this::bluetoothLoop, "tk-bt").start();
     }
 
-    @Override public int onStartCommand(Intent i, int f, int id) { return START_STICKY; }
+    @Override public int onStartCommand(Intent i, int f, int id) {
+        if (i != null && ACTION_REJECT.equals(i.getAction()))
+            answer(i.getLongExtra("id", -1), Authenticator.ERR_OPERATION_DENIED);
+        return START_STICKY;
+    }
     @Override public IBinder onBind(Intent i) { return null; }
 
     @Override public void onDestroy() {

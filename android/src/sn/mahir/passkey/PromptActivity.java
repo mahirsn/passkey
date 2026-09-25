@@ -8,7 +8,9 @@ import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.SystemClock;
 
-/** One confirmation: fingerprint (or the device PIN). Reports to KeyService and closes. */
+/** One confirmation: fingerprint (or the device PIN). Reports to KeyService and
+ *  closes. Closed without an answer (back), the request stays open: the
+ *  notification opens the prompt again, or rejects it. */
 public class PromptActivity extends Activity {
     private CancellationSignal cancel = new CancellationSignal();
     private boolean started, reported, unlocking;
@@ -54,8 +56,8 @@ public class PromptActivity extends Activity {
                     started = false;
                     if (hasWindowFocus()) authenticate();
                 }
-                @Override public void onDismissCancelled() { unlocking = false; report(Authenticator.ERR_OPERATION_DENIED); }
-                @Override public void onDismissError() { unlocking = false; report(Authenticator.ERR_OPERATION_DENIED); }
+                @Override public void onDismissCancelled() { unlocking = false; finish(); }
+                @Override public void onDismissError() { unlocking = false; finish(); }
             });
             return;
         }
@@ -83,6 +85,15 @@ public class PromptActivity extends Activity {
                             }
                             return;
                         }
+                        if (code == BiometricPrompt.BIOMETRIC_ERROR_TIMEOUT && !reported) {
+                            started = false;          // the sensor's own time ran out; ask again
+                            if (hasWindowFocus()) authenticate();
+                            return;
+                        }
+                        if (code == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED) {
+                            finish();                 // closed, not refused
+                            return;
+                        }
                         report(Authenticator.ERR_OPERATION_DENIED);
                     }
                 });
@@ -101,7 +112,7 @@ public class PromptActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
-        report(Authenticator.ERR_OPERATION_DENIED);
+        if (!reported) KeyService.detach(id, this);
         super.onDestroy();
     }
 }
