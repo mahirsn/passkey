@@ -124,7 +124,13 @@ impl Ask {
         if self.pidfd >= 0 {
             // SAFETY: pidfd is owned by this Ask and closed only here.
             unsafe {
-                libc::syscall(libc::SYS_pidfd_send_signal, self.pidfd, libc::SIGKILL, ptr::null::<c_void>(), 0);
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd,
+                    libc::SIGKILL,
+                    ptr::null::<c_void>(),
+                    0,
+                );
                 libc::close(self.pidfd);
             }
             self.pidfd = -1;
