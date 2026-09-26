@@ -14,8 +14,14 @@ const PAM_SUCCESS: c_int = 0;
 const PAM_IGNORE: c_int = 25;
 const PAM_CONV_ERR: c_int = 19;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
+const PAM_TEXT_INFO: c_int = 4;
 const PAM_AUTHTOK: c_int = 6;
 const MAX_ARGS: usize = 32;
+/// The `passkey` executable, set by the Makefile (PASSKEY_BIN).
+const HELPER: &str = match option_env!("PASSKEY_BIN") {
+    Some(path) => path,
+    None => "/usr/bin/passkey",
+};
 const ASK_PARALLEL: Duration = Duration::from_secs(600);
 const ASK_ON_EMPTY: Duration = Duration::from_secs(45);
 
@@ -37,11 +43,15 @@ unsafe extern "C" {
         ...
     ) -> c_int;
     fn pam_set_item(handle: *mut PamHandle, item: c_int, value: *const c_void) -> c_int;
-    fn pam_info(handle: *mut PamHandle, format: *const c_char, ...) -> c_int;
 }
+// pam_info() is a macro in <security/pam_ext.h>, not an exported symbol; a
+// module that links against it fails to load ("undefined symbol: pam_info").
 
 struct Ask {
     child: Child,
+    // The host (sudo, a display manager) may reap its children itself; a
+    // pidfd still names this helper, a pid could name a reused one.
+    pidfd: c_int,
     result: File,
     deadline: Instant,
 }
@@ -69,6 +79,11 @@ impl Ask {
                 if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                // A helper asked again after Enter is started while this
+                // thread blocks all signals; it must not inherit that.
+                let mut none = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut none);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &none, ptr::null_mut());
                 Ok(())
             });
         }
@@ -81,8 +96,11 @@ impl Ask {
                 return Err(error);
             }
         };
+        // SAFETY: plain syscall on the pid just spawned; -1 on kernels without pidfd.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) } as c_int;
         Ok(Self {
             child,
+            pidfd,
             result: unsafe { File::from_raw_fd(read_fd) },
             deadline: Instant::now() + timeout,
         })
@@ -103,8 +121,17 @@ impl Ask {
     }
 
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if self.pidfd >= 0 {
+            // SAFETY: pidfd is owned by this Ask and closed only here.
+            unsafe {
+                libc::syscall(libc::SYS_pidfd_send_signal, self.pidfd, libc::SIGKILL, ptr::null::<c_void>(), 0);
+                libc::close(self.pidfd);
+            }
+            self.pidfd = -1;
+        } else {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait(); // may fail if the host reaped it; harmless
     }
 }
 
@@ -140,7 +167,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         return PAM_IGNORE;
     }
     let mut on_empty = false;
-    let mut helper = "/usr/bin/passkey".to_string();
+    let mut helper = HELPER.to_string();
     let mut authfile = None;
     let mut options = Vec::new();
     for index in 0..(argc as usize).min(MAX_ARGS) {
@@ -211,6 +238,15 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     let mut prompting = true;
     let mut result = PAM_IGNORE;
 
+    // Signals go to the prompt thread (started above, with the host's mask),
+    // so ^C at the prompt interrupts it as without this module.
+    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        let mut all = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old_mask);
+    }
+
     loop {
         if prompting && let Ok(prompt_result) = receiver.try_recv() {
             prompting = false;
@@ -241,8 +277,10 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
             wipe(answer);
             if ask.is_none() && tries < 3 {
                 unsafe {
-                    pam_info(
+                    pam_prompt(
                         handle,
+                        PAM_TEXT_INFO,
+                        ptr::null_mut(),
                         c"%s".as_ptr(),
                         c"Confirm with your fingerprint on your device.".as_ptr(),
                     );
@@ -291,6 +329,8 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         }
         thread::sleep(Duration::from_millis(20));
     }
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, ptr::null_mut()) };
+    drop(ask);
     drop(prompt_thread);
     result
 }
