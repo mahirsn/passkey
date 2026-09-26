@@ -7,7 +7,8 @@ Your password keeps working either way.
 ## Install
 
 On the phone: install the Passkey app and open it once. Pair it with the
-computer for Bluetooth, or turn on USB debugging for USB.
+computer for Bluetooth, or turn on USB debugging for USB. Set the app's
+battery use to Unrestricted, or the phone may stop it in the background.
 
 On the computer (Arch):
 
@@ -18,10 +19,11 @@ makepkg -si
 passkey add
 ```
 
-Other distributions: install Rust, pam-u2f, libfido2 and systemd, then run
-`make && sudo make install`. USB additionally needs `adb`; Bluetooth needs
-BlueZ. `passkey add` configures the service and PAM before registering the
-device.
+Other distributions: with Rust (cargo) installed, `make && sudo make install`.
+
+`passkey add` sets up the service and PAM, then registers the device. It
+checks your system first and names any missing package (pam-u2f, libfido2;
+`adb` for USB, BlueZ for Bluetooth); it never installs packages itself.
 
 ## Use
 
