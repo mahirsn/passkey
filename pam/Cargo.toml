@@ -1,0 +1,15 @@
+[package]
+name = "pam-passkey"
+version = "1.5.0"
+edition = "2024"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "pam_passkey"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+

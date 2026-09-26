@@ -1,0 +1,20 @@
+[package]
+name = "passkey"
+version = "1.5.0"
+edition = "2024"
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+description = "Use an Android device as a FIDO2 security key on Linux"
+
+[workspace]
+members = ["pam"]
+resolver = "3"
+
+[dependencies]
+libc = "0.2"
+zbus = "5.19"
+
+[profile.release]
+lto = "thin"
+strip = true
+

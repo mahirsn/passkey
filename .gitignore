@@ -5,4 +5,7 @@ tests/
 pc/build/
 pc/src/
 pc/pkg/
+pc/*.log
+pc/*.sig
+/target/
 pc/*.pkg.tar*

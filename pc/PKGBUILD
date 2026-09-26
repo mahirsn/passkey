@@ -1,22 +1,26 @@
-# Builds the computer side from this checkout:  cd pc && makepkg -si
+# Builds from this checkout: cd pc && makepkg -si
 pkgname=passkey
-pkgver=1.4
+pkgver=1.5.0
 pkgrel=1
 pkgdesc="Android device fingerprint as a FIDO2 security key: login, sudo, polkit, browsers"
 arch=(x86_64 aarch64)
 url="https://github.com/mahirsn/passkey"
 license=(GPL-3.0-or-later)
-depends=(pam pam-u2f libfido2 python systemd)
+depends=(pam pam-u2f libfido2 systemd)
 optdepends=('android-tools: connect over USB'
-            'python-dbus: connect over Bluetooth'
-            'python-gobject: connect over Bluetooth'
             'bluez: connect over Bluetooth')
-install=passkey.install
+makedepends=(cargo rust)
 
 build() {
-    make -C "$startdir" PREFIX=/usr BUILDDIR="$srcdir/build"
+    cargo build --manifest-path "$startdir/../Cargo.toml" --workspace --release --locked --target-dir "$srcdir/target"
+}
+
+check() {
+    cargo test --manifest-path "$startdir/../Cargo.toml" --workspace --release --locked --target-dir "$srcdir/target"
 }
 
 package() {
-    make -C "$startdir" PREFIX=/usr BUILDDIR="$srcdir/build" DESTDIR="$pkgdir" install
+    install -Dm755 "$srcdir/target/release/passkey" "$pkgdir/usr/bin/passkey"
+    install -Dm755 "$srcdir/target/release/libpam_passkey.so" "$pkgdir/usr/lib/security/pam_passkey.so"
+    install -Dm644 "$startdir/passkeyd.service" "$pkgdir/usr/lib/systemd/system/passkeyd.service"
 }
