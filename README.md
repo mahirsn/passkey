@@ -1,57 +1,43 @@
 # Passkey
 
-Use your Android device's fingerprint as a security key on Linux:
-login, lock screen, `sudo`, system prompts and browser passkeys. Connects
-over USB or Bluetooth.
+Your Android phone's fingerprint as a security key on Linux: login, lock
+screen, `sudo`, polkit prompts and browser passkeys, over USB or Bluetooth.
+Your password keeps working either way.
 
-## Setup
+## Install
 
-1. Install the Passkey app on your Android device and open it once.
-   - For Bluetooth: pair the device with the computer.
-   - For USB: turn on USB debugging and install `adb` on the computer.
-2. On the computer, install the files, then configure as your user.
-   On Arch:
-   ```
-   git clone https://github.com/mahirsn/passkey
-   cd passkey/pc
-   makepkg -si
-   passkey setup
-   ```
-   Elsewhere, replace `makepkg -si` with `make && sudo make install`.
-   `passkey setup` checks the system first and names any missing package;
-   it installs none itself. Confirm with your fingerprint when asked.
+On the phone: install the Passkey app and open it once. Pair it with the
+computer for Bluetooth, or turn on USB debugging for USB.
 
-   Needed: pam-u2f (with `pamu2fcfg`), libfido2 tools (`fido2-token`),
-   python3, a kernel with uhid, systemd (without it, setup says how to start
-   the daemon yourself). For USB: `adb`. For Bluetooth: BlueZ and Python
-   D-Bus/GObject bindings. To build: a C compiler and PAM headers.
+On the computer (Arch):
 
-   Coming from the earlier `pc/passkey setup` installer: before `makepkg -si`,
-   run `sudo rm /usr/lib/security/pam_passkey.so` (pacman refuses to overwrite
-   it); `passkey setup` then clears the rest of the old files.
+```
+git clone https://github.com/mahirsn/passkey
+cd passkey/pc
+makepkg -si
+passkey setup
+```
+
+Other distributions: `make && sudo make install` instead of `makepkg -si`.
+
+`passkey setup` checks your system and tells you what is missing; it never
+installs packages itself. You need pam-u2f, libfido2, python3 and systemd,
+plus `adb` for USB or BlueZ with python-dbus and python-gobject for Bluetooth.
+
+## Use
+
+```
+passkey status          what is connected and registered
+passkey add [name]      register a device
+passkey list            registered devices
+passkey remove <n>      unregister a device
+passkey uninstall       undo setup
+```
+
+With several devices connected, every one of them is asked and the first
+answer counts. A device on both USB and Bluetooth uses USB.
 
 ## Layout
 
-```
-pc/        computer side: passkeyd (daemon), passkey (CLI), PAM module
-           Makefile (PREFIX, DESTDIR), PKGBUILD
-android/   the app; android/build.sh builds it from the SDK, no Gradle
-Makefile   make (pc), make android, make install
-```
-
-## Commands
-
-```
-passkey status             # what is connected and registered
-passkey add [name]         # register another device (asks which, if several are connected)
-passkey list               # registered devices
-passkey remove <n|name>    # unregister a device
-passkey uninstall          # undo setup, registrations included
-```
-
-With several devices connected, a sign-in asks all of them at once and the
-first to answer wins. A device connected over both USB and Bluetooth is
-asked once, over USB.
-
-Removing: `sudo make uninstall` (or `pacman -R passkey`) runs
-`passkey uninstall` first, then removes the files.
+`pc/` holds the daemon, the `passkey` command and the PAM module.
+`android/` holds the app; `android/build.sh` builds it without Gradle.
