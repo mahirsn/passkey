@@ -9,18 +9,25 @@ license=(GPL-3.0-or-later)
 depends=(pam pam-u2f libfido2 systemd)
 optdepends=('android-tools: connect over USB'
             'bluez: connect over Bluetooth')
-makedepends=(cargo rust)
+makedepends=(cargo)
+
+_make() {
+    make -C "$startdir/.." PREFIX=/usr CARGO_TARGET_DIR="$srcdir/target" "$@"
+}
+
+prepare() {
+    # Crates are downloaded here, once; build and check work offline.
+    cargo fetch --locked --manifest-path "$startdir/../Cargo.toml"
+}
 
 build() {
-    cargo build --manifest-path "$startdir/../Cargo.toml" --workspace --release --locked --target-dir "$srcdir/target"
+    _make CARGO_FLAGS=--frozen pc
 }
 
 check() {
-    cargo test --manifest-path "$startdir/../Cargo.toml" --workspace --release --locked --target-dir "$srcdir/target"
+    _make CARGO_FLAGS=--frozen test
 }
 
 package() {
-    install -Dm755 "$srcdir/target/release/passkey" "$pkgdir/usr/bin/passkey"
-    install -Dm755 "$srcdir/target/release/libpam_passkey.so" "$pkgdir/usr/lib/security/pam_passkey.so"
-    install -Dm644 "$startdir/passkeyd.service" "$pkgdir/usr/lib/systemd/system/passkeyd.service"
+    _make CARGO_FLAGS=--frozen DESTDIR="$pkgdir" install
 }

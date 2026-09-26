@@ -7,7 +7,7 @@ Before=display-manager.service
 [Service]
 Type=exec
 ExecStartPre=-/usr/bin/modprobe uhid
-ExecStart=/usr/bin/passkey daemon
+ExecStart=@BINDIR@/passkey daemon
 Restart=on-failure
 RestartSec=2
 RuntimeDirectory=passkey
