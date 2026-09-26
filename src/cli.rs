@@ -67,6 +67,7 @@ pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::E
 
 fn add(given_name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let user = current_user()?;
+    check_environment()?;
     privileged(&["root-configure", &user], None)?;
     println!("Open the Passkey app on your Android device (USB cable or Bluetooth)...");
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -171,6 +172,16 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         "device: {}",
         virtual_device().unwrap_or_else(|| "not connected".into())
     );
+    for service in PARALLEL.iter().chain(ON_EMPTY) {
+        if fs::read_to_string(format!("/etc/pam.d/{service}"))
+            .is_ok_and(|text| text.lines().any(is_ours))
+        {
+            println!("PAM: {service}");
+        }
+    }
+    if let Err(error) = check_environment() {
+        eprintln!("{error}");
+    }
     println!("registered:");
     print_devices(&current_user()?)?;
     Ok(())
@@ -192,16 +203,6 @@ fn configure(user: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !Path::new("/etc/pam.d").is_dir() {
         return Err("this system does not use Linux-PAM".into());
     }
-    if !Path::new("/usr/bin/passkey").is_file()
-        || !Path::new("/usr/lib/security/pam_passkey.so").is_file()
-    {
-        return Err("passkey is not installed; install the package first".into());
-    }
-    for program in ["pamu2fcfg", "fido2-token"] {
-        if !program_exists(program) {
-            return Err(format!("missing required command: {program}").into());
-        }
-    }
     if !Path::new("/dev/uhid").exists() {
         let _ = Command::new("modprobe").arg("uhid").status();
     }
@@ -209,17 +210,19 @@ fn configure(user: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err("/dev/uhid is unavailable; the kernel needs CONFIG_UHID".into());
     }
 
-    write_file(
-        Path::new(DROPIN),
-        format!("[Service]\nEnvironment=PASSKEY_ADB_USER={user}\n").as_bytes(),
-        0o644,
-    )?;
-    Command::new("systemctl").arg("daemon-reload").status()?;
-    let enabled = Command::new("systemctl")
-        .args(["enable", "--now", "passkeyd.service"])
-        .status()?;
-    if !enabled.success() {
-        return Err("could not enable passkeyd.service".into());
+    if has_systemd() {
+        write_file(
+            Path::new(DROPIN),
+            format!("[Service]\nEnvironment=PASSKEY_ADB_USER={user}\n").as_bytes(),
+            0o644,
+        )?;
+        Command::new("systemctl").arg("daemon-reload").status()?;
+        let enabled = Command::new("systemctl")
+            .args(["enable", "--now", "passkeyd.service"])
+            .status()?;
+        if !enabled.success() {
+            return Err("could not enable passkeyd.service".into());
+        }
     }
     for service in PARALLEL.iter().chain(ON_EMPTY) {
         pam_add(service)?;
@@ -231,12 +234,16 @@ fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     for service in PARALLEL.iter().chain(ON_EMPTY) {
         pam_remove(service)?;
     }
-    let _ = Command::new("systemctl")
-        .args(["disable", "--now", "passkeyd.service"])
-        .status();
+    if has_systemd() {
+        let _ = Command::new("systemctl")
+            .args(["disable", "--now", "passkeyd.service"])
+            .status();
+    }
     let _ = fs::remove_dir_all("/etc/systemd/system/passkeyd.service.d");
     let _ = fs::remove_dir_all("/etc/passkey");
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    if has_systemd() {
+        let _ = Command::new("systemctl").arg("daemon-reload").status();
+    }
     println!("Configuration and registrations removed.");
     Ok(())
 }
@@ -248,9 +255,22 @@ fn pam_line(service: &str) -> Result<String, Box<dyn std::error::Error>> {
         "parallel"
     };
     let origin = format!("pam://{}", hostname()?);
-    Ok(format!(
-        "-auth      sufficient   pam_passkey.so mode={mode} authfile={KEYS} origin={origin} appid={origin} userverification=1 nouserok"
-    ))
+    let u2f = format!("authfile={KEYS} origin={origin} appid={origin} userverification=1 nouserok");
+    // pam_passkey hands a typed password to the next module; a stack whose
+    // pam_unix does not take it (try_first_pass / use_first_pass, missing in
+    // Debian's common-auth) would ask for it twice, so there plain pam_u2f
+    // asks the device first.
+    if pam_module_dir().is_some_and(|dir| dir.join("pam_passkey.so").is_file())
+        && unix_takes_password()
+    {
+        Ok(format!(
+            "-auth      sufficient   pam_passkey.so mode={mode} {u2f}"
+        ))
+    } else {
+        Ok(format!(
+            "-auth      sufficient   pam_u2f.so {u2f} cue [cue_prompt=Confirm with your fingerprint on your device, or reject there to type your password]"
+        ))
+    }
 }
 
 fn pam_add(service: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -271,6 +291,10 @@ fn pam_add(service: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut output = Vec::new();
     let mut inserted = false;
     for line in input.lines() {
+        if line == MARK {
+            output.push(line);
+            continue;
+        }
         if is_ours(line) {
             if !inserted {
                 output.push(wanted.as_str());
@@ -279,6 +303,10 @@ fn pam_add(service: &str) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         if !inserted && is_auth(line) && !is_guard(line) {
+            // A mark with no line of ours after it (an older install) is kept once.
+            if output.last() == Some(&MARK) {
+                output.pop();
+            }
             output.push(MARK);
             output.push(wanted.as_str());
             inserted = true;
@@ -390,6 +418,7 @@ fn root_store(user: &str) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("invalid credential")?;
     let mut key_lines = read_optional(KEYS)?
         .lines()
+        .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
     if let Some(line) = key_lines
@@ -400,13 +429,9 @@ fn root_store(user: &str) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         key_lines.push(format!("{user}{credential}"));
     }
-    let mut names = read_optional(NAMES)?;
+    let mut names = lines_file(&read_optional(NAMES)?.lines().collect::<Vec<_>>());
     names.push_str(&format!("{user}\t{handle}\t{name}\n"));
-    write_file(
-        Path::new(KEYS),
-        format!("{}\n", key_lines.join("\n")).as_bytes(),
-        0o644,
-    )?;
+    write_file(Path::new(KEYS), lines_file(&key_lines).as_bytes(), 0o644)?;
     write_file(Path::new(NAMES), names.as_bytes(), 0o644)?;
     Ok(())
 }
@@ -429,20 +454,15 @@ fn root_remove(user: &str, handle: &str) -> Result<(), Box<dyn std::error::Error
             out.push(format!("{owner}:{}", credentials.join(":")));
         }
     }
-    write_file(
-        Path::new(KEYS),
-        format!("{}\n", out.join("\n")).as_bytes(),
-        0o644,
-    )?;
+    write_file(Path::new(KEYS), lines_file(&out).as_bytes(), 0o644)?;
     let names = names
         .lines()
         .filter(|line| {
             let mut fields = line.split('\t');
             fields.next() != Some(user) || fields.next() != Some(handle)
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    write_file(Path::new(NAMES), format!("{names}\n").as_bytes(), 0o644)?;
+        .collect::<Vec<_>>();
+    write_file(Path::new(NAMES), lines_file(&names).as_bytes(), 0o644)?;
     Ok(())
 }
 
@@ -477,6 +497,16 @@ fn names_for(user: &str) -> io::Result<Vec<String>> {
                 .unwrap_or_else(|| format!("Android device {}", index + 1))
         })
         .collect())
+}
+
+/// Lines as a file: one per line, no blank ones, empty when there are none.
+fn lines_file<S: AsRef<str>>(lines: &[S]) -> String {
+    lines
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 fn read_optional(path: &str) -> io::Result<String> {
@@ -515,7 +545,9 @@ fn select_connection(
         print!("Device number: ");
         io::stdout().flush()?;
         let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
+        if io::stdin().read_line(&mut answer)? == 0 {
+            return Err("no device chosen".into()); // end of input (Ctrl-D)
+        }
         if let Ok(index) = answer.trim().parse::<usize>()
             && let Some(device) = devices.get(index.saturating_sub(1))
         {
@@ -613,6 +645,152 @@ fn hostname() -> io::Result<String> {
         .into_owned())
 }
 
+fn has_systemd() -> bool {
+    Path::new("/run/systemd/system").is_dir() // what sd_booted(3) checks
+}
+
+/// Where PAM loads modules from: the directory holding pam_unix.so.
+fn pam_module_dir() -> Option<PathBuf> {
+    [
+        "/usr/lib/security",
+        "/usr/lib64/security",
+        "/lib/security",
+        "/lib64/security",
+        "/usr/lib/x86_64-linux-gnu/security",
+        "/lib/x86_64-linux-gnu/security",
+        "/usr/lib/aarch64-linux-gnu/security",
+        "/lib/aarch64-linux-gnu/security",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|dir| dir.join("pam_unix.so").is_file())
+}
+
+fn unix_takes_password() -> bool {
+    ["system-auth", "common-auth", "password-auth"]
+        .iter()
+        .any(|file| {
+            fs::read_to_string(format!("/etc/pam.d/{file}")).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    !line.trim_start().starts_with('#')
+                        && line.contains("pam_unix.so")
+                        && (line.contains("try_first_pass") || line.contains("use_first_pass"))
+                })
+            })
+        })
+}
+
+/// The package that provides something, by distribution family.
+fn package(arch: &str, debian: &str, fedora: &str) -> String {
+    let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let ids = release
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("ID=")
+                .or_else(|| line.strip_prefix("ID_LIKE="))
+        })
+        .flat_map(|value| {
+            value
+                .trim_matches('"')
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let has = |id: &str| ids.iter().any(|value| value == id);
+    if has("arch") {
+        arch.into()
+    } else if has("debian") || has("ubuntu") {
+        debian.into()
+    } else if has("fedora") || has("rhel") {
+        fedora.into()
+    } else {
+        format!("{arch} (Arch) / {debian} (Debian) / {fedora} (Fedora)")
+    }
+}
+
+/// What this computer needs, checked when it is used (not when installed):
+/// missing requirements stop, missing transports only warn. Nothing is
+/// installed; missing packages are named.
+fn check_environment() -> Result<(), Box<dyn std::error::Error>> {
+    let mut missing = Vec::new();
+    let mut warnings = Vec::new();
+    let pam_dir = pam_module_dir();
+    if !Path::new("/etc/pam.d").is_dir() || pam_dir.is_none() {
+        return Err("this system does not use Linux-PAM".into());
+    }
+    let pam_dir = pam_dir.unwrap_or_default();
+    if !pam_dir.join("pam_u2f.so").is_file() {
+        missing.push(format!(
+            "pam_u2f.so: {}",
+            package("pam-u2f", "libpam-u2f", "pam-u2f")
+        ));
+    }
+    if !pam_dir.join("pam_passkey.so").is_file() {
+        missing.push(format!(
+            "pam_passkey.so is not in {} (install passkey with PAMDIR={})",
+            pam_dir.display(),
+            pam_dir.display()
+        ));
+    }
+    if !program_exists("pamu2fcfg") {
+        missing.push(format!(
+            "pamu2fcfg: {}",
+            package("pam-u2f", "pamu2fcfg", "pamu2fcfg")
+        ));
+    }
+    if !program_exists("fido2-token") {
+        missing.push(format!(
+            "fido2-token: {}",
+            package("libfido2", "fido2-tools", "fido2-tools")
+        ));
+    }
+    if unsafe { libc::geteuid() } != 0 && !program_exists("sudo") {
+        missing.push("sudo (or run passkey as root)".into());
+    }
+    let usb = program_exists("adb");
+    if !usb {
+        warnings.push(format!(
+            "USB off: adb is missing ({})",
+            package("android-tools", "adb", "android-tools")
+        ));
+    }
+    let bluetooth = if has_systemd() {
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", "bluetooth.service"])
+            .status()
+            .is_ok_and(|status| status.success())
+    } else {
+        program_exists("bluetoothd") || Path::new("/usr/lib/bluetooth/bluetoothd").is_file()
+    };
+    if !bluetooth {
+        warnings.push(format!(
+            "Bluetooth off: BlueZ is not running ({})",
+            package("bluez", "bluez", "bluez")
+        ));
+    }
+    if !has_systemd() {
+        let user = current_user().unwrap_or_default();
+        warnings.push(format!(
+            "systemd is not running, so the service is not set up. Start it as root at boot with your init system:\n    PASSKEY_ADB_USER={user} {} daemon",
+            env::current_exe().map(|path| path.display().to_string()).unwrap_or_else(|_| "passkey".into())
+        ));
+    }
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+    if !missing.is_empty() {
+        return Err(format!("missing, please install:\n  {}", missing.join("\n  ")).into());
+    }
+    if !usb && !bluetooth {
+        return Err(
+            "neither USB (adb) nor Bluetooth (BlueZ) is available: no way to reach the device"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn program_exists(program: &str) -> bool {
     env::var_os("PATH").is_some_and(|path| {
         env::split_paths(&path).any(|directory| directory.join(program).is_file())
@@ -630,6 +808,13 @@ fn require_root() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_lines_without_blanks() {
+        assert_eq!(lines_file::<&str>(&[]), "");
+        assert_eq!(lines_file(&["", "a:b", ""]), "a:b\n");
+        assert_eq!(lines_file(&["a", "b".to_string().as_str()]), "a\nb\n");
+    }
 
     #[test]
     fn recognizes_only_our_pam_lines() {
