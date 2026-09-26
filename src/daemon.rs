@@ -72,7 +72,12 @@ const SDP_RECORD: &str = r#"<?xml version="1.0" encoding="UTF-8" ?>
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(STATE)?;
     let daemon = Arc::new(Daemon::new());
-    for task in [adb_loop as fn(Arc<Daemon>), keepalive_loop, bluetooth_loop] {
+    for task in [
+        adb_loop as fn(Arc<Daemon>),
+        keepalive_loop,
+        bluetooth_loop,
+        update_loop,
+    ] {
         let daemon = daemon.clone();
         thread::spawn(move || task(daemon));
     }
@@ -309,14 +314,14 @@ impl Daemon {
             .collect()
     }
 
-    fn by_device(&self) -> HashMap<String, Arc<Link>> {
+    /// One connection per device, USB before Bluetooth (less delay), then
+    /// the oldest; devices in that same order.
+    fn by_device(&self) -> Vec<Arc<Link>> {
         let mut links = self.live_links();
         links.sort_by_key(|link| link.priority);
-        let mut devices = HashMap::new();
-        for link in links {
-            devices.entry(link.device.clone()).or_insert(link);
-        }
-        devices
+        let mut seen = HashSet::new();
+        links.retain(|link| seen.insert(link.device.clone()));
+        links
     }
 
     fn sync_uhid(self: &Arc<Self>) {
@@ -623,26 +628,23 @@ impl Daemon {
 
     fn handle_cbor(self: Arc<Self>, request: Arc<Request>, data: Vec<u8>) {
         let devices = self.by_device();
+        let find = |device: &str| devices.iter().find(|link| link.device == device).cloned();
         let chosen = chosen_device();
         let probe = silent(&data);
         let (holders, last) = {
             let hid = self.hid.lock().unwrap();
             (hid.holders.clone(), hid.last.clone())
         };
-        let all = devices.values().cloned().collect::<Vec<_>>();
+        let all = devices.clone();
         let rounds: Vec<Vec<Arc<Link>>> = if let Some(chosen) = chosen {
-            vec![devices.get(&chosen).cloned().into_iter().collect()]
+            vec![find(&chosen).into_iter().collect()]
         } else if data[0] == GET_INFO {
             vec![all.into_iter().take(1).collect()]
         } else if data[0] == GET_NEXT_ASSERTION {
-            vec![
-                last.and_then(|device| devices.get(&device).cloned())
-                    .into_iter()
-                    .collect(),
-            ]
+            vec![last.and_then(|device| find(&device)).into_iter().collect()]
         } else if data[0] == GET_ASSERTION
             && !probe
-            && holders.iter().any(|device| devices.contains_key(device))
+            && devices.iter().any(|link| holders.contains(&link.device))
         {
             let first = all
                 .iter()
@@ -833,6 +835,20 @@ fn withdraw(request: &Request, links: &[Arc<Link>]) {
     }
 }
 
+/// After a package update the running daemon is the old program: its file is
+/// gone. It exits when idle and systemd (Restart=on-failure) starts the new one.
+fn update_loop(daemon: Arc<Daemon>) {
+    loop {
+        thread::sleep(Duration::from_secs(10));
+        let replaced = fs::read_link("/proc/self/exe")
+            .is_ok_and(|path| path.to_string_lossy().ends_with(" (deleted)"));
+        if replaced && daemon.hid.lock().unwrap().busy.is_none() {
+            println!("passkey was updated; restarting");
+            std::process::exit(75);
+        }
+    }
+}
+
 fn keepalive_loop(daemon: Arc<Daemon>) {
     loop {
         thread::sleep(Duration::from_secs(20));
@@ -848,6 +864,11 @@ fn keepalive_loop(daemon: Arc<Daemon>) {
 fn adb_loop(daemon: Arc<Daemon>) {
     if std::env::var("PASSKEY_NO_USB").as_deref() == Ok("1") {
         return;
+    }
+    let has_adb = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("adb").is_file()));
+    if !has_adb {
+        eprintln!("usb: adb is not installed; USB is off");
     }
     let mut retry = HashMap::<String, Instant>::new();
     let mut last_start = Instant::now() - Duration::from_secs(61);
@@ -1099,6 +1120,11 @@ impl Profile {
                 bluetooth_alias(&connection, &device_path).unwrap_or_else(|| address.clone());
             let fd: OwnedFd = fd.into();
             let stream = UnixStream::from(fd);
+            // The descriptor may come non-blocking from BlueZ; reads here wait.
+            if let Err(error) = stream.set_nonblocking(false) {
+                eprintln!("bluetooth: {error}");
+                return;
+            }
             if let Ok(link) = Link::new(
                 format!("bt:{address}"),
                 Stream::Unix(stream),
