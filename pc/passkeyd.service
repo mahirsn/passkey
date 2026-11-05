@@ -1,5 +1,5 @@
 [Unit]
-Description=passkey: Android device fingerprint as a FIDO2 key (USB and Bluetooth)
+Description=passkey: Android device fingerprint as a FIDO2 key (USB, Wi-Fi and Bluetooth)
 After=bluetooth.service
 Wants=bluetooth.service
 Before=display-manager.service
