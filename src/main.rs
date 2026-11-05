@@ -1,6 +1,7 @@
 mod cli;
 mod daemon;
 mod pam_auth;
+mod wifi;
 
 fn main() {
     if let Err(error) = run() {
