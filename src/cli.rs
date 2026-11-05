@@ -19,6 +19,33 @@ const ON_EMPTY: &[&str] = &["kde", "plasmalogin", "sddm", "gdm-password", "light
 pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         "add" => add(args.first().map(String::as_str)),
+        "wifi" => wifi_command(&args),
+        "root-wifi-add" => {
+            require_root()?;
+            let mut data = String::new();
+            io::stdin().take(513).read_to_string(&mut data)?;
+            if data.len() > 512 {
+                return Err("Wi-Fi profile too long".into());
+            }
+            let peer = crate::wifi::Peer::decode(&data)?;
+            let (_, label) = peer.connect()?;
+            crate::wifi::save(&peer)?;
+            println!("Paired over Wi-Fi: {label} at {}", peer.address);
+            Ok(())
+        }
+        "root-wifi-list" => {
+            require_root()?;
+            for peer in crate::wifi::load()? {
+                println!("{}  {}", peer.address, &peer.id()[..12]);
+            }
+            Ok(())
+        }
+        "root-wifi-remove" => {
+            require_root()?;
+            crate::wifi::remove(args.first().ok_or("missing phone IP address")?)?;
+            println!("Wi-Fi pairing removed.");
+            Ok(())
+        }
         "list" => {
             print_devices(&current_user()?)?;
             Ok(())
@@ -57,7 +84,7 @@ pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::E
         }
         "help" | "--help" | "-h" => {
             println!(
-                "Usage: passkey <command>\n\nCommands:\n  add [name]\n  list\n  remove <number or name>\n  status\n  uninstall"
+                "Usage: passkey <command>\n\nCommands:\n  add [name]\n  wifi add <phone-ip[:port]>\n  wifi list\n  wifi remove <phone-ip[:port]>\n  list\n  remove <number or name>\n  status\n  uninstall"
             );
             Ok(())
         }
@@ -65,11 +92,70 @@ pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::E
     }
 }
 
+fn wifi_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match args.first().map(String::as_str) {
+        Some("add") if args.len() == 2 => {
+            crate::wifi::endpoint(&args[1])?;
+            print!("Paste the pairing code from Passkey on your phone (input hidden): ");
+            io::stdout().flush()?;
+            let code = pairing_input()?;
+            let peer = crate::wifi::Peer::parse(&args[1], &code)?;
+            privileged(&["root-wifi-add"], Some(peer.encode().as_bytes()))?;
+            println!(
+                "Keep Wi-Fi enabled in the app. Run `passkey add` if this phone is not registered yet."
+            );
+            Ok(())
+        }
+        Some("list") if args.len() == 1 => privileged(&["root-wifi-list"], None),
+        Some("remove") if args.len() == 2 => {
+            crate::wifi::endpoint(&args[1])?;
+            privileged(&["root-wifi-remove", &args[1]], None)
+        }
+        _ => Err(
+            "usage: passkey wifi add <phone-ip[:port]> | list | remove <phone-ip[:port]>".into(),
+        ),
+    }
+}
+
+fn pairing_input() -> io::Result<String> {
+    struct Echo(Option<libc::termios>);
+    impl Drop for Echo {
+        fn drop(&mut self) {
+            if let Some(original) = &self.0 {
+                unsafe {
+                    libc::tcsetattr(0, libc::TCSANOW, original);
+                }
+            }
+        }
+    }
+    let mut restore = Echo(None);
+    if io::stdin().is_terminal() {
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(0, original.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        // Match password prompts: terminal signals must not strand the terminal with echo off.
+        hidden.c_lflag &= !(libc::ECHO | libc::ISIG);
+        if unsafe { libc::tcsetattr(0, libc::TCSANOW, &hidden) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        restore.0 = Some(original);
+    }
+    let mut code = String::new();
+    use std::io::BufRead;
+    io::stdin().lock().take(256).read_line(&mut code)?;
+    drop(restore);
+    println!();
+    Ok(code.trim().to_string())
+}
+
 fn add(given_name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let user = current_user()?;
     check_environment()?;
     privileged(&["root-configure", &user], None)?;
-    println!("Open the Passkey app on your Android device (USB cable or Bluetooth)...");
+    println!("Open the Passkey app on your Android device (USB, paired Wi-Fi or Bluetooth)...");
     let deadline = Instant::now() + Duration::from_secs(90);
     while virtual_device().is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_secs(2));
@@ -172,6 +258,9 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
         "device: {}",
         virtual_device().unwrap_or_else(|| "not connected".into())
     );
+    for (_, label) in connected_devices()? {
+        println!("connected: {label}");
+    }
     for service in PARALLEL.iter().chain(ON_EMPTY) {
         if fs::read_to_string(format!("/etc/pam.d/{service}"))
             .is_ok_and(|text| text.lines().any(is_ours))
@@ -782,9 +871,10 @@ fn check_environment() -> Result<(), Box<dyn std::error::Error>> {
     if !missing.is_empty() {
         return Err(format!("missing, please install:\n  {}", missing.join("\n  ")).into());
     }
-    if !usb && !bluetooth {
+    let wifi = Path::new(crate::wifi::DIRECTORY).is_dir();
+    if !usb && !bluetooth && !wifi {
         return Err(
-            "neither USB (adb) nor Bluetooth (BlueZ) is available: no way to reach the device"
+            "no USB (adb), Bluetooth (BlueZ) or paired Wi-Fi device is available; use passkey wifi add <phone-ip>"
                 .into(),
         );
     }

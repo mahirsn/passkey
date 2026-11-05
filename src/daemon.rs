@@ -76,6 +76,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         adb_loop as fn(Arc<Daemon>),
         keepalive_loop,
         bluetooth_loop,
+        wifi_loop,
         update_loop,
     ] {
         let daemon = daemon.clone();
@@ -89,6 +90,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),
+    Tls(crate::wifi::TlsStream),
 }
 
 impl Stream {
@@ -96,6 +98,7 @@ impl Stream {
         match self {
             Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
             Self::Unix(stream) => stream.try_clone().map(Self::Unix),
+            Self::Tls(stream) => Ok(Self::Tls(stream.clone())),
         }
     }
 
@@ -103,6 +106,10 @@ impl Stream {
         let _ = match self {
             Self::Tcp(stream) => stream.shutdown(Shutdown::Both),
             Self::Unix(stream) => stream.shutdown(Shutdown::Both),
+            Self::Tls(stream) => {
+                stream.shutdown();
+                Ok(())
+            }
         };
     }
 }
@@ -112,6 +119,7 @@ impl Read for Stream {
         match self {
             Self::Tcp(stream) => stream.read(buffer),
             Self::Unix(stream) => stream.read(buffer),
+            Self::Tls(stream) => stream.read(buffer),
         }
     }
 }
@@ -121,6 +129,7 @@ impl Write for Stream {
         match self {
             Self::Tcp(stream) => stream.write(buffer),
             Self::Unix(stream) => stream.write(buffer),
+            Self::Tls(stream) => stream.write(buffer),
         }
     }
 
@@ -128,6 +137,7 @@ impl Write for Stream {
         match self {
             Self::Tcp(stream) => stream.flush(),
             Self::Unix(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }
@@ -314,7 +324,7 @@ impl Daemon {
             .collect()
     }
 
-    /// One connection per device, USB before Bluetooth (less delay), then
+    /// One connection per device, USB before Wi-Fi before Bluetooth, then
     /// the oldest; devices in that same order.
     fn by_device(&self) -> Vec<Arc<Link>> {
         let mut links = self.live_links();
@@ -861,6 +871,43 @@ fn keepalive_loop(daemon: Arc<Daemon>) {
     }
 }
 
+fn wifi_loop(daemon: Arc<Daemon>) {
+    loop {
+        match crate::wifi::load() {
+            Ok(peers) => {
+                let wanted = peers
+                    .iter()
+                    .map(|peer| format!("wifi:{}@{}", peer.id(), peer.address))
+                    .collect::<HashSet<_>>();
+                for link in daemon.live_links() {
+                    if link.name.starts_with("wifi:") && !wanted.contains(&link.name) {
+                        link.close();
+                    }
+                }
+                for peer in peers {
+                    let name = format!("wifi:{}@{}", peer.id(), peer.address);
+                    if daemon.live_links().iter().any(|link| link.name == name) {
+                        continue;
+                    }
+                    if let Ok((stream, label)) = peer.connect() {
+                        if let Ok(link) = Link::new(
+                            name,
+                            Stream::Tls(stream),
+                            1,
+                            label,
+                            format!("wifi:{}", peer.id()),
+                        ) {
+                            let _ = daemon.add(link);
+                        }
+                    }
+                }
+            }
+            Err(error) => eprintln!("wifi profiles: {error}"),
+        }
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
 fn adb_loop(daemon: Arc<Daemon>) {
     if std::env::var("PASSKEY_NO_USB").as_deref() == Ok("1") {
         return;
@@ -1128,7 +1175,7 @@ impl Profile {
             if let Ok(link) = Link::new(
                 format!("bt:{address}"),
                 Stream::Unix(stream),
-                1,
+                2,
                 label,
                 address,
             ) {

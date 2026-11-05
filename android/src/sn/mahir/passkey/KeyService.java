@@ -30,8 +30,9 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Talks to the computer. Two transports, same frames:
+/** Talks to the computer. Three transports, same frames:
  *  - USB: adb connects to the abstract socket "passkey" (only adbd/root may connect).
+ *  - Wi-Fi: paired TLS through WifiTransport.
  *  - Bluetooth: RFCOMM to a paired computer that registered BT_UUID.
  *  Frame: 4-byte big-endian length + body. body[0] is the type; REQ, RESP and
  *  CANCEL then carry a 4-byte request number, so a late answer or a stale
@@ -50,6 +51,7 @@ public class KeyService extends Service {
     static volatile KeyService running;
 
     private Authenticator auth;
+    WifiTransport wifi;
     private volatile boolean stop;
     private int connections;
 
@@ -184,6 +186,8 @@ public class KeyService extends Service {
                         new Intent(this, MainActivity.class), PendingIntent.FLAG_IMMUTABLE))
                 .build();
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+        wifi = new WifiTransport(this);
+        if (!Flags.AUTO_APPROVE) wifi.start();
         new Thread(this::localLoop, "tk-usb").start();
         if (!Flags.AUTO_APPROVE) new Thread(this::bluetoothLoop, "tk-bt").start();
     }
@@ -198,6 +202,7 @@ public class KeyService extends Service {
     @Override public void onDestroy() {
         stop = true;
         running = null;
+        if (wifi != null) wifi.stop();
         super.onDestroy();
     }
 
@@ -256,7 +261,7 @@ public class KeyService extends Service {
     interface Closer { void close() throws IOException; }
 
     /** Runs one connection until it closes. */
-    private void serve(String name, InputStream is, OutputStream os, Closer closer) {
+    void serve(String name, InputStream is, OutputStream os, Closer closer) {
         Conn conn = new Conn();
         synchronized (this) { connections++; link = name; }
         DataInputStream in = new DataInputStream(is);

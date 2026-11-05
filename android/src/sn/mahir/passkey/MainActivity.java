@@ -96,9 +96,12 @@ public class MainActivity extends Activity {
         boolean overlay = Settings.canDrawOverlays(this);
         boolean battery = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
         String link = KeyService.link;
+        boolean wifi = WifiTransport.enabled(this);
+        String wifiState = KeyService.running != null && KeyService.running.wifi != null ? KeyService.running.wifi.status : "Starting…";
+        String wifiAddresses = String.join(", ", WifiTransport.addresses(this));
 
         StringBuilder key = new StringBuilder(String.valueOf(link));
-        key.append(bt).append(notif).append(overlay).append(battery);
+        key.append(bt).append(notif).append(overlay).append(battery).append(wifi).append(wifiState).append(wifiAddresses);
         if (key.toString().equals(lastRender)) return;
         lastRender = key.toString();
         root.removeAllViews();
@@ -125,18 +128,54 @@ public class MainActivity extends Activity {
         row.addView(st);
         c.addView(row);
         c.addView(body(link != null ? link
-                : "Plug in a USB cable or keep Bluetooth on near your computer. "
+                : "Connect over paired Wi-Fi, plug in a USB cable or keep Bluetooth on near your computer. "
                   + "The connection is picked up automatically."));
         root.addView(c);
 
+        LinearLayout wifiCard = card();
+        wifiCard.addView(heading("Local Wi-Fi"));
+        wifiCard.addView(body(wifi ? wifiState + (wifiAddresses.isEmpty() ? " — connect to Wi-Fi first." : " — " + wifiAddresses + ":" + WifiTransport.PORT)
+                : "Connect directly on the same Wi-Fi. USB debugging and Bluetooth are not required."));
+        wifiCard.addView(button(wifi ? "Turn Wi-Fi off" : "Enable Wi-Fi", true, v -> {
+            getSharedPreferences("wifi", MODE_PRIVATE).edit().putBoolean("enabled", !wifi).apply();
+            if (KeyService.running != null && KeyService.running.wifi != null) {
+                if (wifi) KeyService.running.wifi.disable(); else KeyService.running.wifi.start();
+            }
+            lastRender = ""; render();
+        }));
+        if (wifi) {
+            wifiCard.addView(body("Install the computer companion supplied with this Wi-Fi build.\nOn your computer: passkey wifi add <phone IP>\nPaste the pairing code when asked, then run passkey add."));
+            wifiCard.addView(button("Copy pairing code", false, v -> {
+                try {
+                    if (KeyService.running == null || KeyService.running.wifi == null) return;
+                    android.content.ClipData clip = android.content.ClipData.newPlainText("Passkey Wi-Fi pairing", KeyService.running.wifi.pairingCode());
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                        extras.putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true);
+                        clip.getDescription().setExtras(extras);
+                    }
+                    getSystemService(android.content.ClipboardManager.class).setPrimaryClip(clip);
+                    android.widget.Toast.makeText(this, "Pairing code copied. Keep it private.", android.widget.Toast.LENGTH_SHORT).show();
+                } catch (Exception e) {
+                    android.widget.Toast.makeText(this, "Could not create pairing code", android.widget.Toast.LENGTH_LONG).show();
+                }
+            }));
+            wifiCard.addView(button("Forget all Wi-Fi computers", false, v -> new android.app.AlertDialog.Builder(this)
+                    .setTitle("Reset Wi-Fi pairing?").setMessage("Connected Wi-Fi computers will be disconnected and must pair again.")
+                    .setNegativeButton("Cancel", null).setPositiveButton("Reset", (dialog, which) -> {
+                        try { if (KeyService.running != null) KeyService.running.wifi.reset(); }
+                        catch (java.io.IOException e) { android.widget.Toast.makeText(this, "Could not reset pairing", android.widget.Toast.LENGTH_LONG).show(); }
+                    }).show()));
+        }
+        root.addView(wifiCard);
+
         // Setup
-        boolean ready = bt && notif;
+        boolean ready = notif;
         if (!ready || !overlay || !battery) {
             LinearLayout s = card();
             s.addView(heading("Setup"));
-            if (!ready) step(s, "Bluetooth and notifications", "Required to reach your computer and to ask for your fingerprint.",
-                    "Allow", v -> requestPermissions(new String[]{
-                            Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.POST_NOTIFICATIONS}, 1));
+            if (!notif) step(s, "Notifications", "Required to ask for your fingerprint.",
+                    "Allow", v -> requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1));
             if (!overlay) step(s, "Show prompts instantly (optional)",
                     "Lets the fingerprint prompt open by itself. Without it, tap the notification.",
                     "Open settings", v -> startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -150,14 +189,17 @@ public class MainActivity extends Activity {
         // Computer
         LinearLayout pc = card();
         pc.addView(heading("On your computer"));
-        pc.addView(body("Linux: install the companion, then run \"passkey setup\". "
+        pc.addView(body("Linux: install the companion, then run \"passkey add\". "
                 + "It adds your fingerprint to login, the lock screen, sudo and system prompts, "
                 + "and makes it work as a passkey in your browser."));
         pc.addView(body("For Bluetooth, pair this device with the computer once in Bluetooth settings."));
         LinearLayout btns = new LinearLayout(this);
-        btns.addView(button("Get companion", true, v ->
+        btns.addView(button(wifi ? "Original project" : "Get companion", true, v ->
                 startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(COMPANION_URL)))));
-        Button pair = button("Pair Bluetooth", false, v -> startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS)));
+        Button pair = button("Pair Bluetooth", false, v -> {
+            if (!bt && Build.VERSION.SDK_INT >= 31) requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 1);
+            else startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+        });
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
         lp.leftMargin = dp(8);
         btns.addView(pair, lp);

@@ -6,7 +6,7 @@ pkgdesc="Android device fingerprint as a FIDO2 security key: login, sudo, polkit
 arch=(x86_64 aarch64)
 url="https://github.com/mahirsn/passkey"
 license=(GPL-3.0-or-later)
-depends=(pam pam-u2f libfido2 systemd)
+depends=(pam pam-u2f libfido2 systemd openssl)
 optdepends=('android-tools: connect over USB'
             'bluez: connect over Bluetooth')
 makedepends=(cargo)
