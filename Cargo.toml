@@ -12,6 +12,7 @@ resolver = "3"
 
 [dependencies]
 libc = "0.2"
+openssl = "0.10"
 zbus = "5.19"
 
 [profile.release]

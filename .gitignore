@@ -9,3 +9,16 @@ pc/*.log
 pc/*.sig
 /target/
 pc/*.pkg.tar*
+
+# Local signing and pairing secrets
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.pass
+.env
+.env.*
+*.apk
+*.aab
