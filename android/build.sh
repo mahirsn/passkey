@@ -6,18 +6,19 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 SDK="${ANDROID_HOME:-$HOME/Android/Sdk}"
-JAR="$SDK/platforms/android-37.0/android.jar"
-BT="$SDK/build-tools/36.0.0"
 TARGET=36
+JAR="${ANDROID_JAR:-$SDK/platforms/android-$TARGET/android.jar}"
+BT="$SDK/build-tools/${ANDROID_BUILD_TOOLS:-36.0.0}"
 MIN=30
 KEY="${PASSKEY_KEYSTORE:-$HOME/.config/env/passkey-upload.jks}"
 PASS_FILE="${PASSKEY_KEYPASS:-$HOME/.config/env/passkey-upload.jks.pass}"
 # bundletool and its dependencies from the Gradle cache (any past Android Studio build leaves them).
 G="$HOME/.gradle/caches/modules-2/files-2.1"
-BUNDLETOOL_CP="${BUNDLETOOL_CP:-$(find "$G"/{com.android.tools.build,com.google.guava,com.google.protobuf,com.google.dagger,javax.inject,org.bitbucket.b_c,org.slf4j,com.google.errorprone,com.google.auto.value,org.checkerframework} \
-    -name '*.jar' ! -name '*sources*' 2>/dev/null | grep -vE 'gradle-|aapt2-[0-9]|builder-|lint' | tr '\n' ':')}"
+if [[ -z "${BUNDLETOOL_CP:-}" ]]; then
+    BUNDLETOOL_CP="$( (find "$G" -name '*.jar' ! -name '*sources*' 2>/dev/null || true) | grep -vE 'gradle-|aapt2-[0-9]|builder-|lint' | tr '\n' ':' || true)"
+fi
 AUTO="${PASSKEY_AUTO_APPROVE:-0}"
-quiet() { "$@" 2>&1 | grep -v '^WARNING' || true; }
+quiet() { "$@" 2>&1 | awk '!/^WARNING/'; }
 
 rm -rf out && mkdir -p out/classes out/dex out/gen
 cat > out/gen/Flags.java <<J
@@ -25,7 +26,11 @@ package sn.mahir.passkey;
 final class Flags { static final boolean AUTO_APPROVE = $AUTO == 1; }
 J
 RENAME=()
-[[ "$AUTO" == 1 ]] && RENAME=(--rename-manifest-package sn.mahir.passkey.test)
+if [[ "$AUTO" == 1 ]]; then
+    RENAME=(--rename-manifest-package sn.mahir.passkey.test)
+elif [[ -n "${PASSKEY_PACKAGE:-}" ]]; then
+    RENAME=(--rename-manifest-package "$PASSKEY_PACKAGE")
+fi
 
 "$BT/aapt2" compile --dir res -o out/res.zip
 link() {
@@ -35,7 +40,7 @@ link() {
 link -o out/unsigned.apk --java out/gen
 javac -encoding UTF-8 --release 17 -nowarn -classpath "$JAR" -d out/classes $(find src out/gen -name '*.java')
 "$BT/d8" --min-api $MIN --lib "$JAR" --output out/dex $(find out/classes -name '*.class')
-(cd out/dex && zip -q ../unsigned.apk classes.dex)
+jar uf out/unsigned.apk -C out/dex classes.dex
 "$BT/zipalign" -f 4 out/unsigned.apk out/aligned.apk
 
 if [[ ! -f "$KEY" ]]; then
@@ -53,9 +58,9 @@ echo "out/passkey.apk"
 if [[ "$AUTO" != 1 && "$BUNDLETOOL_CP" == *bundletool* ]]; then
     link --proto-format -o out/proto.apk
     rm -rf out/base && mkdir -p out/base/manifest out/base/dex
-    (cd out/base && unzip -q ../proto.apk && mv AndroidManifest.xml manifest/)
+    (cd out/base && jar xf ../proto.apk && mv AndroidManifest.xml manifest/)
     cp out/dex/classes.dex out/base/dex/
-    (cd out/base && zip -qr ../base.zip .)
+    jar --create --file out/base.zip --no-manifest -C out/base .
     quiet java -cp "$BUNDLETOOL_CP" com.android.tools.build.bundletool.BundleToolMain \
         build-bundle --modules=out/base.zip --output=out/passkey.aab
     jarsigner -keystore "$KEY" -storepass:file "$PASS_FILE" -keypass:file "$PASS_FILE" \
