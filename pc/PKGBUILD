@@ -1,6 +1,6 @@
 # Builds from this checkout: cd pc && makepkg -si
 pkgname=passkey
-pkgver=1.6.0
+pkgver=1.6.1
 pkgrel=1
 pkgdesc="Android device fingerprint as a FIDO2 security key: login, sudo, polkit, browsers"
 arch=(x86_64 aarch64)
