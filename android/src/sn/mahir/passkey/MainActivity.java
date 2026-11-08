@@ -91,7 +91,7 @@ public class MainActivity extends Activity {
 
     // --- screen ----------------------------------------------------------------------
     private void render() {
-        boolean bt = granted(Manifest.permission.BLUETOOTH_CONNECT);
+        boolean bt = Build.VERSION.SDK_INT < 31 || granted(Manifest.permission.BLUETOOTH_CONNECT);
         boolean notif = Build.VERSION.SDK_INT < 33 || granted(Manifest.permission.POST_NOTIFICATIONS);
         boolean overlay = Settings.canDrawOverlays(this);
         boolean battery = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
@@ -144,7 +144,7 @@ public class MainActivity extends Activity {
             lastRender = ""; render();
         }));
         if (wifi) {
-            wifiCard.addView(body("Install the computer companion supplied with this Wi-Fi build.\nOn your computer: passkey wifi add <phone IP>\nPaste the pairing code when asked, then run passkey add."));
+            wifiCard.addView(body("On your computer: passkey wifi add <phone IP>, paste the pairing code when asked, then run passkey add."));
             wifiCard.addView(button("Copy pairing code", false, v -> {
                 try {
                     if (KeyService.running == null || KeyService.running.wifi == null) return;
@@ -171,11 +171,13 @@ public class MainActivity extends Activity {
 
         // Setup
         boolean ready = notif;
-        if (!ready || !overlay || !battery) {
+        if (!ready || !bt || !overlay || !battery) {
             LinearLayout s = card();
             s.addView(heading("Setup"));
             if (!notif) step(s, "Notifications", "Required to ask for your fingerprint.",
                     "Allow", v -> requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1));
+            if (!bt) step(s, "Bluetooth (optional)", "Needed only to connect over Bluetooth.",
+                    "Allow", v -> requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 1));
             if (!overlay) step(s, "Show prompts instantly (optional)",
                     "Lets the fingerprint prompt open by itself. Without it, tap the notification.",
                     "Open settings", v -> startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -194,7 +196,7 @@ public class MainActivity extends Activity {
                 + "and makes it work as a passkey in your browser."));
         pc.addView(body("For Bluetooth, pair this device with the computer once in Bluetooth settings."));
         LinearLayout btns = new LinearLayout(this);
-        btns.addView(button(wifi ? "Original project" : "Get companion", true, v ->
+        btns.addView(button("Get companion", true, v ->
                 startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(COMPANION_URL)))));
         Button pair = button("Pair Bluetooth", false, v -> {
             if (!bt && Build.VERSION.SDK_INT >= 31) requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, 1);

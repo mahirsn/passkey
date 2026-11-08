@@ -14,9 +14,8 @@ KEY="${PASSKEY_KEYSTORE:-$HOME/.config/env/passkey-upload.jks}"
 PASS_FILE="${PASSKEY_KEYPASS:-$HOME/.config/env/passkey-upload.jks.pass}"
 # bundletool and its dependencies from the Gradle cache (any past Android Studio build leaves them).
 G="$HOME/.gradle/caches/modules-2/files-2.1"
-if [[ -z "${BUNDLETOOL_CP:-}" ]]; then
-    BUNDLETOOL_CP="$( (find "$G" -name '*.jar' ! -name '*sources*' 2>/dev/null || true) | grep -vE 'gradle-|aapt2-[0-9]|builder-|lint' | tr '\n' ':' || true)"
-fi
+BUNDLETOOL_CP="${BUNDLETOOL_CP:-$(find "$G"/{com.android.tools.build,com.google.guava,com.google.protobuf,com.google.dagger,javax.inject,org.bitbucket.b_c,org.slf4j,com.google.errorprone,com.google.auto.value,org.checkerframework} \
+    -name '*.jar' ! -name '*sources*' 2>/dev/null | grep -vE 'gradle-|aapt2-[0-9]|builder-|lint' | tr '\n' ':' || true)}"
 AUTO="${PASSKEY_AUTO_APPROVE:-0}"
 quiet() { "$@" 2>&1 | awk '!/^WARNING/'; }
 
