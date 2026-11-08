@@ -58,7 +58,6 @@ const CTAP2_ERR_OTHER: u8 = 0x7f;
 const GET_ASSERTION: u8 = 0x02;
 const GET_INFO: u8 = 0x04;
 const GET_NEXT_ASSERTION: u8 = 0x08;
-const OPERATION_DENIED: u8 = 0x27;
 const NO_CREDENTIALS: u8 = 0x2e;
 const BROADCAST: u32 = u32::MAX;
 
@@ -778,7 +777,9 @@ impl Daemon {
                     wins.push((link, payload));
                     done = !wait_all;
                 } else {
-                    done = payload[0] == OPERATION_DENIED && !wait_all;
+                    // A refusal ends only that device's prompt: another device
+                    // (a phone whose sensor fails at once) must not cancel the
+                    // one the user is about to touch.
                     errors.push(payload);
                 }
                 if done {
