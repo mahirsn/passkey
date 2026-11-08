@@ -1,0 +1,8 @@
+post_upgrade() {
+    # Move an existing setup to this version's PAM services.
+    local user
+    user=$(sed -n 's/^Environment=PASSKEY_ADB_USER=//p' /etc/systemd/system/passkeyd.service.d/user.conf 2>/dev/null)
+    if [[ -n $user && -f /etc/passkey/u2f_keys ]]; then
+        passkey root-configure "$user" >/dev/null || true
+    fi
+}

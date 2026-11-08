@@ -1,6 +1,6 @@
 # Builds from this checkout: cd pc && makepkg -si
 pkgname=passkey
-pkgver=1.5.1
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="Android device fingerprint as a FIDO2 security key: login, sudo, polkit, browsers"
 arch=(x86_64 aarch64)
@@ -10,6 +10,7 @@ depends=(pam pam-u2f libfido2 systemd openssl)
 optdepends=('android-tools: connect over USB'
             'bluez: connect over Bluetooth')
 makedepends=(cargo)
+install=passkey.install
 
 _make() {
     make -C "$startdir/.." PREFIX=/usr CARGO_TARGET_DIR="$srcdir/target" "$@"
