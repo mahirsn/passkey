@@ -12,6 +12,7 @@ Restart=on-failure
 RestartSec=2
 RuntimeDirectory=passkey
 RuntimeDirectoryMode=0755
+StateDirectory=passkey
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

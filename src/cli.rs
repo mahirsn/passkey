@@ -360,6 +360,7 @@ fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = fs::remove_dir_all("/etc/systemd/system/passkeyd.service.d");
     let _ = fs::remove_dir_all("/etc/passkey");
+    let _ = fs::remove_dir_all("/var/lib/passkey");
     if has_systemd() {
         let _ = Command::new("systemctl").arg("daemon-reload").status();
     }

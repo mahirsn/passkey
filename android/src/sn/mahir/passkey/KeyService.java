@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
 import android.content.Context;
 import android.content.Intent;
@@ -26,6 +27,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,12 +36,14 @@ import java.util.concurrent.Executors;
 /** Talks to the computer. Three transports, same frames:
  *  - USB: adb connects to the abstract socket "passkey" (only adbd/root may connect).
  *  - Wi-Fi: paired TLS through WifiTransport.
- *  - Bluetooth: RFCOMM to a paired computer that registered BT_UUID.
+ *  - Bluetooth: RFCOMM to a paired computer that registered BT_UUID, or from
+ *    one to PHONE_UUID here (a computer waking up connects at once).
  *  Frame: 4-byte big-endian length + body. body[0] is the type; REQ, RESP and
  *  CANCEL then carry a 4-byte request number, so a late answer or a stale
  *  cancel never applies to a newer request. */
 public class KeyService extends Service {
     static final UUID BT_UUID = UUID.fromString("7a1b6b65-7900-4e6f-9d2a-6d6168697273");
+    static final UUID PHONE_UUID = UUID.fromString("7a1b6b65-7900-4e6f-9d2a-6d6168697274");
     static final int REQ = 0x10, CANCEL = 0x11, PING = 0x12, RESP = 0x20, PONG = 0x22;
     // The computer ends a request when its own prompt closes; this only covers
     // a computer that went quiet without saying so.
@@ -54,6 +59,9 @@ public class KeyService extends Service {
     WifiTransport wifi;
     private volatile boolean stop;
     private int connections;
+    /** Computers connected over Bluetooth, by address: one connection each. */
+    private final Set<String> bluetoothPeers = new HashSet<>();
+    private volatile BluetoothServerSocket bluetoothServer;
 
     /** One computer connection. */
     static final class Conn {
@@ -190,6 +198,7 @@ public class KeyService extends Service {
         if (!Flags.AUTO_APPROVE) wifi.start();
         new Thread(this::localLoop, "tk-usb").start();
         if (!Flags.AUTO_APPROVE) new Thread(this::bluetoothLoop, "tk-bt").start();
+        if (!Flags.AUTO_APPROVE) new Thread(this::bluetoothListen, "tk-bt-in").start();
     }
 
     @Override public int onStartCommand(Intent i, int f, int id) {
@@ -203,6 +212,8 @@ public class KeyService extends Service {
         stop = true;
         running = null;
         if (wifi != null) wifi.stop();
+        BluetoothServerSocket server = bluetoothServer;
+        if (server != null) try { server.close(); } catch (IOException ignored) {}
         super.onDestroy();
     }
 
@@ -240,15 +251,20 @@ public class KeyService extends Service {
                     for (BluetoothDevice d : ad.getBondedDevices()) {
                         BluetoothClass k = d.getBluetoothClass();
                         if (k == null || k.getMajorDeviceClass() != BluetoothClass.Device.Major.COMPUTER) continue;
-                        BluetoothSocket s = d.createRfcommSocketToServiceRecord(BT_UUID);
+                        if (!claim(d.getAddress())) continue;
                         try {
-                            s.connect();
-                        } catch (IOException e) {
-                            try { s.close(); } catch (IOException ignored) {}
-                            continue;
+                            BluetoothSocket s = d.createRfcommSocketToServiceRecord(BT_UUID);
+                            try {
+                                s.connect();
+                            } catch (IOException e) {
+                                try { s.close(); } catch (IOException ignored) {}
+                                continue;
+                            }
+                            serve("To " + d.getName() + " over Bluetooth",
+                                    s.getInputStream(), s.getOutputStream(), s::close);
+                        } finally {
+                            release(d.getAddress());
                         }
-                        serve("To " + d.getName() + " over Bluetooth",
-                                s.getInputStream(), s.getOutputStream(), s::close);
                     }
                 }
             } catch (SecurityException | IOException e) {
@@ -257,6 +273,46 @@ public class KeyService extends Service {
             try { Thread.sleep(15_000); } catch (InterruptedException e) { return; }
         }
     }
+
+    /** A paired computer connects here when it wakes up, instead of waiting
+     *  for bluetoothLoop's next round. Secure RFCOMM: bonded devices only. */
+    private void bluetoothListen() {
+        BluetoothAdapter ad = getSystemService(BluetoothManager.class).getAdapter();
+        while (!stop) {
+            try {
+                if (ad != null && ad.isEnabled() && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                        == PackageManager.PERMISSION_GRANTED) {
+                    try (BluetoothServerSocket server = ad.listenUsingRfcommWithServiceRecord("Passkey", PHONE_UUID)) {
+                        bluetoothServer = server;
+                        while (!stop) {
+                            BluetoothSocket s = server.accept();
+                            BluetoothDevice d = s.getRemoteDevice();
+                            if (d.getBondState() != BluetoothDevice.BOND_BONDED || !claim(d.getAddress())) {
+                                s.close();
+                                continue;
+                            }
+                            new Thread(() -> {
+                                try {
+                                    serve("To " + d.getName() + " over Bluetooth",
+                                            s.getInputStream(), s.getOutputStream(), s::close);
+                                } catch (IOException | SecurityException e) {
+                                    Log.w(TAG, "bluetooth", e);
+                                } finally {
+                                    release(d.getAddress());
+                                }
+                            }, "tk-bt-conn").start();
+                        }
+                    }
+                }
+            } catch (SecurityException | IOException e) {
+                if (!stop) Log.w(TAG, "bluetooth listen", e);
+            }
+            try { Thread.sleep(5_000); } catch (InterruptedException e) { return; }
+        }
+    }
+
+    private boolean claim(String address) { synchronized (bluetoothPeers) { return bluetoothPeers.add(address); } }
+    private void release(String address) { synchronized (bluetoothPeers) { bluetoothPeers.remove(address); } }
 
     interface Closer { void close() throws IOException; }
 

@@ -20,6 +20,10 @@ const RESP: u8 = 0x20;
 const PONG: u8 = 0x22;
 const BT_UUID: &str = "7a1b6b65-7900-4e6f-9d2a-6d6168697273";
 const BT_CHANNEL: u16 = 27;
+/// The app listens here too, so a computer that wakes up connects at once.
+const PHONE_UUID: &str = "7a1b6b65-7900-4e6f-9d2a-6d6168697274";
+/// Bluetooth addresses that have connected before: the ones dialed.
+const DIALED: &str = "/var/lib/passkey/bluetooth";
 const STATE: &str = "/run/passkey";
 
 const UHID_DESTROY: u32 = 1;
@@ -76,6 +80,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         adb_loop as fn(Arc<Daemon>),
         keepalive_loop,
         bluetooth_loop,
+        dial_loop,
         wifi_loop,
         update_loop,
     ] {
@@ -1165,6 +1170,7 @@ impl Profile {
                 .unwrap_or_else(|| device_path.clone());
             let label =
                 bluetooth_alias(&connection, &device_path).unwrap_or_else(|| address.clone());
+            remember_dialed(&address);
             let fd: OwnedFd = fd.into();
             let stream = UnixStream::from(fd);
             // The descriptor may come non-blocking from BlueZ; reads here wait.
@@ -1210,13 +1216,15 @@ fn bluetooth_loop(daemon: Arc<Daemon>) {
 
 fn bluetooth_session(daemon: Arc<Daemon>) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::system()?;
-    connection.object_server().at(
-        "/sn/mahir/passkey",
-        Profile {
-            daemon,
-            connection: connection.clone(),
-        },
-    )?;
+    for path in ["/sn/mahir/passkey", "/sn/mahir/passkey/dial"] {
+        connection.object_server().at(
+            path,
+            Profile {
+                daemon: daemon.clone(),
+                connection: connection.clone(),
+            },
+        )?;
+    }
     let proxy = Proxy::new(
         &connection,
         "org.bluez",
@@ -1238,8 +1246,102 @@ fn bluetooth_session(daemon: Arc<Daemon>) -> Result<(), Box<dyn std::error::Erro
             Err(error) if error.to_string().contains("AlreadyExists") => {}
             Err(error) => eprintln!("bluetooth: not registered: {error}"),
         }
+        let mut options = HashMap::<&str, Value<'_>>::new();
+        options.insert("Name", Value::from("passkey"));
+        options.insert("Role", Value::from("client"));
+        options.insert("RequireAuthentication", Value::from(true));
+        options.insert("AutoConnect", Value::from(false));
+        let path = ObjectPath::try_from("/sn/mahir/passkey/dial")?;
+        // Registered with the server profile above; an error here repeats it.
+        let _ = proxy.call::<_, _, ()>("RegisterProfile", &(path, PHONE_UUID, options));
         thread::sleep(Duration::from_secs(10));
     }
+}
+
+fn remember_dialed(address: &str) {
+    let known = fs::read_to_string(DIALED).unwrap_or_default();
+    if !known.lines().any(|line| line == address) {
+        let _ = fs::write(DIALED, format!("{known}{address}\n"));
+    }
+}
+
+/// After the computer wakes up the device would reconnect on its own only on
+/// its next round (up to tens of seconds): the computer connects instead.
+/// It tries every 2 s for a minute after starting or waking; otherwise the
+/// device's own reconnecting is enough, and dialing would page it for nothing.
+fn dial_loop(daemon: Arc<Daemon>) {
+    let asleep = || {
+        let clock = |id| {
+            let mut time = unsafe { std::mem::zeroed::<libc::timespec>() };
+            unsafe { libc::clock_gettime(id, &mut time) };
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        };
+        clock(libc::CLOCK_BOOTTIME).saturating_sub(clock(libc::CLOCK_MONOTONIC))
+    };
+    let mut slept = asleep();
+    let mut eager_until = Instant::now() + Duration::from_secs(60);
+    let mut next = Instant::now();
+    loop {
+        thread::sleep(Duration::from_secs(2));
+        if asleep() > slept + Duration::from_secs(1) {
+            slept = asleep();
+            eager_until = Instant::now() + Duration::from_secs(60);
+            next = Instant::now();
+        }
+        if Instant::now() < next || Instant::now() > eager_until {
+            continue;
+        }
+        next = Instant::now() + Duration::from_secs(2);
+        let known = fs::read_to_string(DIALED).unwrap_or_default();
+        let linked = daemon
+            .live_links()
+            .iter()
+            .map(|link| link.device.clone())
+            .collect::<HashSet<_>>();
+        let wanted = known
+            .lines()
+            .filter(|address| !linked.contains(*address))
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            continue;
+        }
+        let Ok(connection) = Connection::system() else {
+            continue;
+        };
+        for path in bluetooth_devices(&connection, &wanted) {
+            if let Ok(device) =
+                Proxy::new(&connection, "org.bluez", path.as_str(), "org.bluez.Device1")
+            {
+                // Fails quickly when the device is away or runs an older app.
+                let _ = device.call::<_, _, ()>("ConnectProfile", &(PHONE_UUID,));
+            }
+        }
+    }
+}
+
+/// BlueZ object paths of the paired devices with these addresses.
+fn bluetooth_devices(connection: &Connection, addresses: &[&str]) -> Vec<OwnedObjectPath> {
+    type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+    let Ok(manager) = Proxy::new(
+        connection,
+        "org.bluez",
+        "/",
+        "org.freedesktop.DBus.ObjectManager",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(objects) = manager.call::<_, _, Objects>("GetManagedObjects", &()) else {
+        return Vec::new();
+    };
+    objects
+        .into_iter()
+        .filter_map(|(path, interfaces)| {
+            let device = interfaces.get("org.bluez.Device1")?;
+            let address = String::try_from(device.get("Address")?.try_clone().ok()?).ok()?;
+            let paired = bool::try_from(device.get("Paired")?.try_clone().ok()?).ok()?;
+            (paired && addresses.contains(&address.as_str())).then_some(path)
+        })
+        .collect()
 }
 
 fn bluetooth_alias(connection: &Connection, path: &str) -> Option<String> {
