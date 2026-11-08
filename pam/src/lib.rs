@@ -241,6 +241,10 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         .then(|| Ask::start(timeout, &helper, &user, &options).ok())
         .flatten();
     let mut tries = usize::from(ask.is_some());
+    let started = Instant::now();
+    // A request that failed without the user refusing (the computer slept,
+    // the connection dropped) is sent again while the prompt is open.
+    let mut retry_at = None;
 
     let prompt = if on_empty {
         c"Password: "
@@ -339,6 +343,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         if let Some(active) = ask.as_mut() {
             match active.answer() {
                 Ok(Some(approved)) => {
+                    let refused = active.refused;
                     ask = None;
                     if approved {
                         result = PAM_SUCCESS;
@@ -357,6 +362,9 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
                     if !prompting {
                         break;
                     }
+                    if !on_empty && !refused {
+                        retry_at = Some(Instant::now() + Duration::from_secs(2));
+                    }
                 }
                 Ok(None) if Instant::now() >= active.deadline => {
                     ask = None;
@@ -364,11 +372,29 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
                         break;
                     }
                 }
-                Err(_) => ask = None,
+                Err(_) => {
+                    ask = None;
+                    if !on_empty {
+                        retry_at = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
                 _ => {}
             }
         } else if !prompting {
             break;
+        } else if let Some(at) = retry_at
+            && Instant::now() >= at
+        {
+            let left = (started + ASK_PARALLEL).saturating_duration_since(Instant::now());
+            retry_at = None;
+            if !left.is_zero() {
+                if device_present() {
+                    ask = Ask::start(left, &helper, &user, &options).ok();
+                }
+                if ask.is_none() {
+                    retry_at = Some(Instant::now() + Duration::from_secs(2));
+                }
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
