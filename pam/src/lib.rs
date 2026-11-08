@@ -16,6 +16,8 @@ const PAM_CONV_ERR: c_int = 19;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
 const PAM_TEXT_INFO: c_int = 4;
 const PAM_AUTHTOK: c_int = 6;
+const PAM_AUTH_ERR: c_int = 7;
+const PAM_AUTHINFO_UNAVAIL: c_int = 9;
 const MAX_ARGS: usize = 32;
 /// The `passkey` executable, set by the Makefile (PASSKEY_BIN).
 const HELPER: &str = match option_env!("PASSKEY_BIN") {
@@ -24,6 +26,7 @@ const HELPER: &str = match option_env!("PASSKEY_BIN") {
 };
 const ASK_PARALLEL: Duration = Duration::from_secs(600);
 const ASK_ON_EMPTY: Duration = Duration::from_secs(45);
+const ASK_BACKGROUND: Duration = Duration::from_secs(120);
 
 #[repr(C)]
 pub struct PamHandle(c_void);
@@ -43,6 +46,7 @@ unsafe extern "C" {
         ...
     ) -> c_int;
     fn pam_set_item(handle: *mut PamHandle, item: c_int, value: *const c_void) -> c_int;
+    fn pam_get_item(handle: *const PamHandle, item: c_int, value: *mut *const c_void) -> c_int;
 }
 // pam_info() is a macro in <security/pam_ext.h>, not an exported symbol; a
 // module that links against it fails to load ("undefined symbol: pam_info").
@@ -54,6 +58,9 @@ struct Ask {
     pidfd: c_int,
     result: File,
     deadline: Instant,
+    /// The helper answered "n": the user said no on the device, rather than
+    /// the request failing (device busy, connection lost).
+    refused: bool,
 }
 
 impl Ask {
@@ -70,7 +77,8 @@ impl Ask {
             .arg(user)
             .args(options)
             .stdin(Stdio::null())
-            .stdout(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         unsafe {
             command.pre_exec(move || {
                 if libc::dup2(write_fd, 3) < 0 {
@@ -84,6 +92,9 @@ impl Ask {
                 let mut none = std::mem::zeroed::<libc::sigset_t>();
                 libc::sigemptyset(&mut none);
                 libc::pthread_sigmask(libc::SIG_SETMASK, &none, ptr::null_mut());
+                // A lock screen kills its PAM worker once a password unlocks;
+                // the request on the device must not outlive it.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 Ok(())
             });
         }
@@ -103,6 +114,7 @@ impl Ask {
             pidfd,
             result: unsafe { File::from_raw_fd(read_fd) },
             deadline: Instant::now() + timeout,
+            refused: false,
         })
     }
 
@@ -117,7 +129,9 @@ impl Ask {
             return Ok(None);
         }
         let mut byte = [0_u8; 1];
-        Ok(Some(self.result.read(&mut byte)? == 1 && byte[0] == b'y'))
+        let read = self.result.read(&mut byte)?;
+        self.refused = read == 1 && byte[0] == b'n';
+        Ok(Some(read == 1 && byte[0] == b'y'))
     }
 
     fn stop(&mut self) {
@@ -173,6 +187,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         return PAM_IGNORE;
     }
     let mut on_empty = false;
+    let mut background = false;
     let mut helper = HELPER.to_string();
     let mut authfile = None;
     let mut options = Vec::new();
@@ -183,6 +198,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
         match value.as_str() {
             "mode=on-empty" => on_empty = true,
             "mode=parallel" => {}
+            "mode=background" => background = true,
             _ if value.starts_with("helper=") => helper = value[7..].to_string(),
             _ => {
                 if let Some(value) = value.strip_prefix("authfile=") {
@@ -204,7 +220,19 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     let user = unsafe { CStr::from_ptr(user_ptr) }
         .to_string_lossy()
         .into_owned();
-    if !device_present() || !user_registered(&authfile, &user) || !is_executable(&helper) {
+    if !user_registered(&authfile, &user) || !is_executable(&helper) {
+        return PAM_IGNORE;
+    }
+    if background {
+        return ask_alone(&helper, &user, &options);
+    }
+    // A stack that reaches this module twice (a lock screen whose file
+    // includes another one of ours) already has the password.
+    let mut typed = ptr::null();
+    if !device_present()
+        || unsafe { pam_get_item(handle, PAM_AUTHTOK, &mut typed) } == PAM_SUCCESS
+            && !typed.is_null()
+    {
         return PAM_IGNORE;
     }
 
@@ -348,6 +376,36 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     drop(ask);
     drop(prompt_thread);
     result
+}
+
+/// mode=background: a service the host runs next to its password prompt
+/// (kscreenlocker's kde-fingerprint). Asks the device and never prompts.
+/// A refusal on the device passes to the rest of the stack (a fingerprint
+/// reader, if any; kscreenlocker then stops asking); a timeout fails so the
+/// host may ask again later.
+fn ask_alone(helper: &str, user: &str, options: &[String]) -> c_int {
+    let deadline = Instant::now() + ASK_BACKGROUND;
+    while Instant::now() < deadline {
+        if !device_present() {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let Ok(mut ask) = Ask::start(deadline - Instant::now(), helper, user, options) else {
+            return PAM_AUTHINFO_UNAVAIL;
+        };
+        loop {
+            match ask.answer() {
+                Ok(Some(true)) => return PAM_SUCCESS,
+                Ok(Some(false)) if ask.refused => return PAM_IGNORE,
+                Ok(Some(false)) | Err(_) => break,
+                Ok(None) if Instant::now() >= ask.deadline => return PAM_AUTH_ERR,
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        // Busy or reconnecting: try again shortly.
+        thread::sleep(Duration::from_secs(2));
+    }
+    PAM_AUTH_ERR
 }
 
 fn device_present() -> bool {

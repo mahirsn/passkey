@@ -49,6 +49,10 @@ passkey remove <n>      unregister a device
 passkey uninstall       undo setup
 ```
 
+`sudo`, polkit, console login and the KDE lock screen ask the device while
+the password prompt is open: use either. Other login and lock screens ask it
+when you press Enter on an empty password.
+
 With several devices connected, every one of them is asked and the first
 answer counts. A device connected several ways uses USB, then Wi-Fi, then
 Bluetooth.

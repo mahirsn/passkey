@@ -14,7 +14,34 @@ const NAMES: &str = "/etc/passkey/names";
 const DROPIN: &str = "/etc/systemd/system/passkeyd.service.d/user.conf";
 const MARK: &str = "# passkey: fingerprint from your Android device (undo with: passkey uninstall)";
 const PARALLEL: &[&str] = &["sudo", "sudo-i", "su", "login", "polkit-1"];
-const ON_EMPTY: &[&str] = &["kde", "plasmalogin", "sddm", "gdm-password", "lightdm"];
+/// Login and lock screens that cannot keep a password prompt open while the
+/// device is asked: they ask it after an empty password.
+const ON_EMPTY: &[&str] = &[
+    "plasmalogin",
+    "sddm",
+    "gdm-password",
+    "lightdm",
+    "lxdm",
+    "ly",
+    "greetd",
+    "xscreensaver",
+    "cinnamon-screensaver",
+    "mate-screensaver",
+    "xfce4-screensaver",
+    "swaylock",
+    "hyprlock",
+    "gtklock",
+    "i3lock",
+];
+/// Services a lock screen runs next to its password prompt (KDE's): the
+/// device is asked there at once and the password service stays untouched.
+const BACKGROUND: &[&str] = &["kde-fingerprint"];
+/// Services an older version set up and this one no longer uses.
+const DROPPED: &[&str] = &["kde"];
+
+fn services() -> impl Iterator<Item = &'static str> {
+    PARALLEL.iter().chain(ON_EMPTY).chain(BACKGROUND).copied()
+}
 
 pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match command {
@@ -261,7 +288,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
     for (_, label) in connected_devices()? {
         println!("connected: {label}");
     }
-    for service in PARALLEL.iter().chain(ON_EMPTY) {
+    for service in services() {
         if fs::read_to_string(format!("/etc/pam.d/{service}"))
             .is_ok_and(|text| text.lines().any(is_ours))
         {
@@ -313,14 +340,17 @@ fn configure(user: &str) -> Result<(), Box<dyn std::error::Error>> {
             return Err("could not enable passkeyd.service".into());
         }
     }
-    for service in PARALLEL.iter().chain(ON_EMPTY) {
+    for service in DROPPED {
+        pam_remove(service)?;
+    }
+    for service in services() {
         pam_add(service)?;
     }
     Ok(())
 }
 
 fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    for service in PARALLEL.iter().chain(ON_EMPTY) {
+    for service in services().chain(DROPPED.iter().copied()) {
         pam_remove(service)?;
     }
     if has_systemd() {
@@ -338,7 +368,9 @@ fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn pam_line(service: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mode = if ON_EMPTY.contains(&service) {
+    let mode = if BACKGROUND.contains(&service) {
+        "background"
+    } else if ON_EMPTY.contains(&service) {
         "on-empty"
     } else {
         "parallel"
@@ -349,9 +381,14 @@ fn pam_line(service: &str) -> Result<String, Box<dyn std::error::Error>> {
     // pam_unix does not take it (try_first_pass / use_first_pass, missing in
     // Debian's common-auth) would ask for it twice, so there plain pam_u2f
     // asks the device first.
-    if pam_module_dir().is_some_and(|dir| dir.join("pam_passkey.so").is_file())
-        && unix_takes_password()
-    {
+    let passkey = pam_module_dir().is_some_and(|dir| dir.join("pam_passkey.so").is_file());
+    if passkey && mode == "background" {
+        // Success and failure are final; a refusal on the device (ignore)
+        // goes on to the stack's own fingerprint reader.
+        Ok(format!(
+            "-auth      [success=done ignore=ignore default=die]   pam_passkey.so mode={mode} {u2f}"
+        ))
+    } else if passkey && unix_takes_password() {
         Ok(format!(
             "-auth      sufficient   pam_passkey.so mode={mode} {u2f}"
         ))

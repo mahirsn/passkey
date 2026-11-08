@@ -1,6 +1,6 @@
 //! `passkey pam-auth USER [pam_u2f options...]`, run by the PAM module: asks
 //! every connected device at once and writes "y" to fd 3 when one of them
-//! signs with a key registered for USER.
+//! signs with a key registered for USER, "n" when the user refuses there.
 //!
 //! pam_u2f, which this used to run, tries the user's keys one after another,
 //! so a second device was only asked after the first had refused or timed
@@ -13,6 +13,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 
 const FIDO_OK: c_int = 0;
+const FIDO_ERR_OPERATION_DENIED: c_int = 0x27;
 const FIDO_OPT_FALSE: c_int = 1;
 const FIDO_OPT_TRUE: c_int = 2;
 const COSE_ES256: c_int = -7;
@@ -108,8 +109,14 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if verification {
         assertion.set_uv(FIDO_OPT_TRUE);
     }
-    if device.get(&assertion) != FIDO_OK {
-        return Err("fingerprint was not approved".into());
+    match device.get(&assertion) {
+        FIDO_OK => {}
+        FIDO_ERR_OPERATION_DENIED => {
+            // Tells the PAM module the user said no, so it does not ask again.
+            unsafe { libc::write(3, b"n".as_ptr().cast(), 1) };
+            return Err("fingerprint was refused".into());
+        }
+        _ => return Err("fingerprint was not approved".into()),
     }
     if !assertion.verify(&credentials) {
         return Err("the device's signature did not verify".into());
