@@ -253,7 +253,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     };
     let (sender, receiver) = mpsc::channel();
     let handle_address = handle as usize;
-    let prompt = move || {
+    let prompt_with = move |sender: mpsc::Sender<PromptResult>| move || {
         let mut answer = ptr::null_mut();
         let status = unsafe {
             pam_prompt(
@@ -277,10 +277,10 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     // function may need that thread (kscreenlocker answers through its event
     // loop), and blocking it while another thread prompts deadlocks.
     let mut prompt_thread = if on_empty {
-        prompt();
+        prompt_with(sender.clone())();
         None
     } else {
-        Some(thread::spawn(prompt))
+        Some(thread::spawn(prompt_with(sender.clone())))
     };
     let mut prompting = true;
     let mut result = PAM_IGNORE;
@@ -322,6 +322,24 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
                 break;
             }
             wipe(answer);
+            if !on_empty {
+                // Enter on an empty (or after a wrong) password: the device
+                // stays asked and the password can be typed again at once.
+                if ask.is_none() && retry_at.is_none() {
+                    retry_at = Some(Instant::now());
+                }
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, ptr::null_mut());
+                }
+                prompt_thread = Some(thread::spawn(prompt_with(sender.clone())));
+                unsafe {
+                    let mut all = std::mem::zeroed::<libc::sigset_t>();
+                    libc::sigfillset(&mut all);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &all, ptr::null_mut());
+                }
+                prompting = true;
+                continue;
+            }
             if ask.is_none() && tries < 3 {
                 unsafe {
                     pam_prompt(
