@@ -188,6 +188,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     }
     let mut on_empty = false;
     let mut background = false;
+    let mut kick = false;
     let mut helper = HELPER.to_string();
     let mut authfile = None;
     let mut options = Vec::new();
@@ -199,6 +200,7 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
             "mode=on-empty" => on_empty = true,
             "mode=parallel" => {}
             "mode=background" => background = true,
+            "mode=kick" => kick = true,
             _ if value.starts_with("helper=") => helper = value[7..].to_string(),
             _ => {
                 if let Some(value) = value.strip_prefix("authfile=") {
@@ -225,6 +227,9 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     }
     if background {
         return ask_alone(&helper, &user, &options);
+    }
+    if kick {
+        return prompt_and_kick(handle);
     }
     // A stack that reaches this module twice (a lock screen whose file
     // includes another one of ours) already has the password.
@@ -253,23 +258,25 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     };
     let (sender, receiver) = mpsc::channel();
     let handle_address = handle as usize;
-    let prompt_with = move |sender: mpsc::Sender<PromptResult>| move || {
-        let mut answer = ptr::null_mut();
-        let status = unsafe {
-            pam_prompt(
-                handle_address as *mut PamHandle,
-                PAM_PROMPT_ECHO_OFF,
-                &mut answer,
-                c"%s".as_ptr(),
-                prompt.as_ptr(),
-            )
-        };
-        let result = PromptResult {
-            status,
-            answer: answer as usize,
-        };
-        if let Err(error) = sender.send(result) {
-            wipe(error.0.answer as *mut c_char);
+    let prompt_with = move |sender: mpsc::Sender<PromptResult>| {
+        move || {
+            let mut answer = ptr::null_mut();
+            let status = unsafe {
+                pam_prompt(
+                    handle_address as *mut PamHandle,
+                    PAM_PROMPT_ECHO_OFF,
+                    &mut answer,
+                    c"%s".as_ptr(),
+                    prompt.as_ptr(),
+                )
+            };
+            let result = PromptResult {
+                status,
+                answer: answer as usize,
+            };
+            if let Err(error) = sender.send(result) {
+                wipe(error.0.answer as *mut c_char);
+            }
         }
     };
     // Only the parallel mode asks the device while the prompt is open. In
@@ -422,14 +429,90 @@ unsafe fn authenticate(handle: *mut PamHandle, argc: c_int, argv: *const *const 
     result
 }
 
+/// Touched by mode=kick (Enter on an empty password, or the unlock button)
+/// to make the mode=background service of the same user ask the device now.
+fn kick_file() -> String {
+    format!("/run/user/{}/passkey-kick", unsafe { libc::getuid() })
+}
+
+fn kicked_at() -> Option<std::time::SystemTime> {
+    fs::metadata(kick_file())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// mode=kick, on the lock screen's own password service (kscreenlocker's kde):
+/// a password goes on to pam_unix; an empty one asks the device through the
+/// background service and opens the prompt again, so either still works.
+fn prompt_and_kick(handle: *mut PamHandle) -> c_int {
+    loop {
+        let mut answer = ptr::null_mut();
+        let status = unsafe {
+            pam_prompt(
+                handle,
+                PAM_PROMPT_ECHO_OFF,
+                &mut answer,
+                c"%s".as_ptr(),
+                c"Password: ".as_ptr(),
+            )
+        };
+        if status != PAM_SUCCESS || answer.is_null() {
+            wipe(answer);
+            return if status == PAM_SUCCESS {
+                PAM_CONV_ERR
+            } else {
+                status
+            };
+        }
+        if unsafe { *answer != 0 } {
+            let status = unsafe { pam_set_item(handle, PAM_AUTHTOK, answer.cast()) };
+            wipe(answer);
+            return if status == PAM_SUCCESS {
+                PAM_IGNORE
+            } else {
+                status
+            };
+        }
+        wipe(answer);
+        let _ = fs::write(kick_file(), b"");
+        unsafe {
+            pam_prompt(
+                handle,
+                PAM_TEXT_INFO,
+                ptr::null_mut(),
+                c"%s".as_ptr(),
+                c"Confirm with your fingerprint on your device.".as_ptr(),
+            );
+        }
+    }
+}
+
 /// mode=background: a service the host runs next to its password prompt
 /// (kscreenlocker's kde-fingerprint). Asks the device and never prompts.
-/// A refusal on the device passes to the rest of the stack (a fingerprint
-/// reader, if any; kscreenlocker then stops asking); a timeout fails so the
-/// host may ask again later.
+/// After a refusal it waits for a kick (mode=kick) instead of asking again;
+/// a kick sends the request again at any time. A timeout fails so the host
+/// asks again when the lock screen shows.
 fn ask_alone(helper: &str, user: &str, options: &[String]) -> c_int {
-    let deadline = Instant::now() + ASK_BACKGROUND;
-    while Instant::now() < deadline {
+    let mut seen = kicked_at();
+    let mut deadline = Instant::now() + ASK_BACKGROUND;
+    let mut refused_at: Option<Instant> = None;
+    loop {
+        let kicked = kicked_at() != seen;
+        if kicked {
+            seen = kicked_at();
+            refused_at = None;
+            deadline = Instant::now() + ASK_BACKGROUND;
+        }
+        if let Some(at) = refused_at {
+            if at.elapsed() > Duration::from_secs(3600) {
+                return PAM_IGNORE;
+            }
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return PAM_AUTH_ERR;
+        }
         if !device_present() {
             thread::sleep(Duration::from_millis(500));
             continue;
@@ -440,16 +523,23 @@ fn ask_alone(helper: &str, user: &str, options: &[String]) -> c_int {
         loop {
             match ask.answer() {
                 Ok(Some(true)) => return PAM_SUCCESS,
-                Ok(Some(false)) if ask.refused => return PAM_IGNORE,
-                Ok(Some(false)) | Err(_) => break,
+                Ok(Some(false)) if ask.refused => {
+                    refused_at = Some(Instant::now());
+                    break;
+                }
+                Ok(Some(false)) | Err(_) => {
+                    // Busy or reconnecting: try again shortly.
+                    thread::sleep(Duration::from_secs(2));
+                    break;
+                }
                 Ok(None) if Instant::now() >= ask.deadline => return PAM_AUTH_ERR,
+                // A kick while asking: the prompt on the device may have
+                // been swiped away, so it is sent again.
+                Ok(None) if kicked_at() != seen => break,
                 Ok(None) => thread::sleep(Duration::from_millis(20)),
             }
         }
-        // Busy or reconnecting: try again shortly.
-        thread::sleep(Duration::from_secs(2));
     }
-    PAM_AUTH_ERR
 }
 
 fn device_present() -> bool {

@@ -36,11 +36,17 @@ const ON_EMPTY: &[&str] = &[
 /// Services a lock screen runs next to its password prompt (KDE's): the
 /// device is asked there at once and the password service stays untouched.
 const BACKGROUND: &[&str] = &["kde-fingerprint"];
-/// Services an older version set up and this one no longer uses.
-const DROPPED: &[&str] = &["kde"];
+/// That lock screen's password service: Enter on an empty password asks the
+/// device through the background service and keeps the prompt open.
+const KICK: &[&str] = &["kde"];
 
 fn services() -> impl Iterator<Item = &'static str> {
-    PARALLEL.iter().chain(ON_EMPTY).chain(BACKGROUND).copied()
+    PARALLEL
+        .iter()
+        .chain(ON_EMPTY)
+        .chain(BACKGROUND)
+        .chain(KICK)
+        .copied()
 }
 
 pub fn run(command: &str, args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -340,9 +346,6 @@ fn configure(user: &str) -> Result<(), Box<dyn std::error::Error>> {
             return Err("could not enable passkeyd.service".into());
         }
     }
-    for service in DROPPED {
-        pam_remove(service)?;
-    }
     for service in services() {
         pam_add(service)?;
     }
@@ -350,7 +353,7 @@ fn configure(user: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
-    for service in services().chain(DROPPED.iter().copied()) {
+    for service in services() {
         pam_remove(service)?;
     }
     if has_systemd() {
@@ -369,7 +372,9 @@ fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn pam_line(service: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mode = if BACKGROUND.contains(&service) {
+    let mode = if KICK.contains(&service) {
+        "kick"
+    } else if BACKGROUND.contains(&service) {
         "background"
     } else if ON_EMPTY.contains(&service) {
         "on-empty"
@@ -383,6 +388,14 @@ fn pam_line(service: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Debian's common-auth) would ask for it twice, so there plain pam_u2f
     // asks the device first.
     let passkey = pam_module_dir().is_some_and(|dir| dir.join("pam_passkey.so").is_file());
+    if mode == "kick" {
+        // Only pam_passkey can do this; pam_u2f here would block the prompt.
+        return Ok(if passkey {
+            format!("-auth      sufficient   pam_passkey.so mode={mode} {u2f}")
+        } else {
+            String::new()
+        });
+    }
     if passkey && mode == "background" {
         // Success and failure are final; a refusal on the device (ignore)
         // goes on to the stack's own fingerprint reader.
@@ -412,6 +425,9 @@ fn pam_add(service: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
     let input = fs::read_to_string(&source)?;
     let wanted = pam_line(service)?;
+    if wanted.is_empty() {
+        return pam_remove(service);
+    }
     if input.lines().any(|line| line == wanted) {
         return Ok(());
     }
